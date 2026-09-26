@@ -69,6 +69,12 @@ def get_job(job_id: str) -> Optional[sqlite3.Row]:
         return cur.fetchone()
 
 
+def get_all_jobs() -> list:
+    with _lock, _connect() as conn:
+        cur = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC")
+        return cur.fetchall()
+
+
 def get_jobs_older_than(seconds: float) -> list:
     cutoff = time.time() - seconds
     with _lock, _connect() as conn:
