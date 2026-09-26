@@ -90,12 +90,17 @@ def _process_job(job_id: str) -> None:
         # DeepFilterNet can fully zero out quiet speech on low-SNR call audio
         # because it looks similar to noise - capping the attenuation keeps
         # that speech audible while still cutting the noise floor substantially.
+        # --pf: post-filter that pushes noise suppression harder on the
+        # noisiest sections. Safe to enable now that --atten-lim puts a floor
+        # under how much speech it can remove in the process.
         denoised_dir.mkdir(parents=True, exist_ok=True)
         _run([
             "deepFilter", str(resampled),
+            "--model-base-dir", "DeepFilterNet3",
             "--output-dir", str(denoised_dir),
             "--no-suffix",
             "--atten-lim", "20",
+            "--pf",
         ])
         denoised_file = denoised_dir / resampled.name
         if not denoised_file.exists():
