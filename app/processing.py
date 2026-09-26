@@ -113,16 +113,17 @@ def _process_job(job_id: str) -> None:
         # a filename suffix (e.g. "..._DeepFilterNet3.wav") rather than reusing
         # the input's exact basename; this makes the output land at the
         # predictable path we expect below.
-        # --atten-lim 30: caps how much the model is allowed to attenuate a
+        # --atten-lim 20: caps how much the model is allowed to attenuate a
         # frame by mixing some of the original signal back in. Without this,
         # DeepFilterNet can fully zero out quiet speech on low-SNR call audio
         # because it looks similar to noise - capping the attenuation keeps
         # that speech audible while still cutting the noise floor substantially.
-        # Raised from 20 after confirming (via spectrogram + band-energy
-        # analysis of a real test recording) that speech survives with margin
-        # at 20 and the remaining residual noise is broadband/pink noise -
-        # exactly what this model targets - so there's headroom to remove more
-        # of it at the source instead of just papering over it downstream.
+        # Briefly raised to 30 without being able to test it locally (no
+        # DeepFilterNet install here) - that produced near-total silence on a
+        # real low-SNR test recording, almost certainly from over-attenuating
+        # actual speech combined with --pf. Reverted to the one value that's
+        # actually been confirmed safe end-to-end. Don't raise this again
+        # without a real test against the deployed server first.
         # --pf: post-filter that pushes noise suppression harder on the
         # noisiest sections. Safe to enable now that --atten-lim puts a floor
         # under how much speech it can remove in the process.
@@ -132,7 +133,7 @@ def _process_job(job_id: str) -> None:
             "--model-base-dir", "DeepFilterNet3",
             "--output-dir", str(denoised_dir),
             "--no-suffix",
-            "--atten-lim", "30",
+            "--atten-lim", "20",
             "--pf",
         ])
         denoised_file = denoised_dir / resampled.name
@@ -148,15 +149,6 @@ def _process_job(job_id: str) -> None:
         #     cleans up steady residual hiss the neural model didn't fully
         #     remove, the standard "polish pass" in professional noise-reduction
         #     workflows (never rely on a single denoising technique alone).
-        #   - agate: noise gate. Measured on a real test recording - actual
-        #     speech sits around -18dB while noise-only pauses sit around
-        #     -37dB, a healthy ~20dB gap - so anything below threshold is
-        #     confidently non-speech and gets pushed further down (verified
-        #     this drops the pause noise floor ~8dB while leaving measured
-        #     speech level completely unchanged). This is what actually
-        #     silences the hiss BETWEEN words, which spectral denoising alone
-        #     doesn't fully do since it works on the noise mixed into speech,
-        #     not the truly noise-only stretches.
         #   - acompressor: gently boosts quiet passages relative to loud ones
         #     (mild 3:1 downward compression) so speech is more consistently
         #     audible, not just louder on average.
@@ -165,18 +157,29 @@ def _process_job(job_id: str) -> None:
         #     noisy audio. Note: loudnorm internally resamples for true-peak
         #     detection (observed output at 96kHz from a 48kHz input) - the
         #     explicit -ar 48000 below forces it back afterward.
-        #   - alimiter: brick-wall safety ceiling in case compression +
-        #     normalization pushes any transient close to full scale - left
-        #     a bit more headroom (0.85, ~-1.4dB) than loudnorm's own TP
-        #     target since lossy re-encoding below can overshoot the true
-        #     peak of the PCM by a fraction of a dB.
+        #   - agate: noise gate, placed AFTER loudnorm rather than before.
+        #     Its threshold was calibrated by measuring real speech (~-18dB)
+        #     vs noise-only pauses (~-37dB) on an already-normalized -14 LUFS
+        #     reference file - a fixed threshold only means anything once the
+        #     signal is at a known, consistent loudness. Placed before
+        #     loudnorm instead, it saw the raw pre-boost signal - wildly
+        #     different levels depending on how quiet the original recording
+        #     was - and gated out actual speech on a quiet call, producing
+        #     near-total silence. After loudnorm, every job hits the gate at
+        #     the same known loudness, so the same threshold is valid for any
+        #     recording regardless of its original volume.
+        #   - alimiter: brick-wall safety ceiling in case compression,
+        #     normalization or the gate's release edge pushes any transient
+        #     close to full scale - left a bit more headroom (0.85, ~-1.4dB)
+        #     than loudnorm's own TP target since lossy re-encoding below can
+        #     overshoot the true peak of the PCM by a fraction of a dB.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(denoised_file),
             "-af", "afftdn=nr=15:nf=-40:tn=1,"
-                   "agate=threshold=0.04:ratio=4:attack=5:release=150:range=0.03,"
                    "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
                    "loudnorm=I=-14:LRA=9:TP=-1.5,"
+                   "agate=threshold=0.04:ratio=4:attack=5:release=150:range=0.03,"
                    "alimiter=limit=0.85",
             "-ar", "48000",
             "-c:a", codec,
