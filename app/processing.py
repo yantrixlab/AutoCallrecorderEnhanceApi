@@ -62,7 +62,17 @@ def _run(cmd: list) -> None:
     logger.info("Running: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Command failed ({cmd[0]}): {result.stderr.strip()[-2000:]}")
+        # Some tools (DeepFilterNet included) print harmless diagnostic lines
+        # to stderr - like a failed `git rev-parse` in a git-less Docker image
+        # - that have nothing to do with why the process actually exited
+        # non-zero. Surfacing only stderr, as before, can point straight at
+        # that noise instead of the real cause. Include both streams and the
+        # exit code so a real failure is diagnosable from the error alone.
+        raise RuntimeError(
+            f"Command failed ({cmd[0]}), exit code {result.returncode}\n"
+            f"stdout: {result.stdout.strip()[-2000:]}\n"
+            f"stderr: {result.stderr.strip()[-2000:]}"
+        )
 
 
 def _process_job(job_id: str) -> None:
