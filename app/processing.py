@@ -235,11 +235,17 @@ def _process_job(job_id: str) -> None:
         #     Note: loudnorm internally resamples for true-peak detection
         #     (observed output at 96kHz from a 48kHz input) - the explicit
         #     -ar 48000 below forces it back afterward.
-        #   - agate: noise gate, placed AFTER loudnorm rather than before.
-        #     Its threshold was calibrated by measuring real speech (~-18dB)
-        #     vs noise-only pauses (~-37dB) on an already-normalized -14 LUFS
-        #     reference file - a fixed threshold only means anything once the
-        #     signal is reliably at that loudness (see the two-pass note above).
+        #   (no noise gate here anymore - removed after it was caught destroying
+        #   real speech on an actual conversation: a 3-second window with clear,
+        #   audible speech in the original - measured -41dB mean / -21dB peak,
+        #   quiet but genuine - came back as -80dB mean / -59dB peak, effectively
+        #   digital silence, in the enhanced output. A single fixed threshold
+        #   can't safely separate "noise" from "someone's naturally quieter
+        #   delivery" across every caller's voice - and for a call-recording
+        #   app, losing real spoken content is a far worse failure than leaving
+        #   a bit of residual hiss between words. DeepFilterNet + afftdn above
+        #   already do the real noise-reduction work; a gate on top of that
+        #   was a cosmetic gain not worth this risk.
         #   - alimiter: brick-wall safety ceiling in case compression,
         #     normalization or the gate's release edge pushes any transient
         #     close to full scale - left a bit more headroom (0.85, ~-1.4dB)
@@ -264,7 +270,6 @@ def _process_job(job_id: str) -> None:
             "ffmpeg", "-y", "-i", str(denoised_file),
             "-af", f"{pre_loudnorm_filters},"
                    f"{loudnorm_filter},"
-                   "agate=threshold=0.04:ratio=4:attack=5:release=150:range=0.03,"
                    "alimiter=limit=0.85",
             "-ar", "48000",
             "-c:a", codec,
