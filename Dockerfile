@@ -23,6 +23,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir deepfilternet
 
+# DeepFilterNet hardcodes `DataLoader(ds, num_workers=2, pin_memory=True)` in
+# its own enhance.py with no CLI flag to change it. Docker's default /dev/shm
+# is only 64MB, which multiprocessing DataLoader workers can exhaust on longer
+# recordings (~10min), crashing with "Bus error... out of shared memory" -
+# confirmed via a live crash against the deployed API. num_workers=0 runs the
+# loader in the main process instead, needing no shared memory at all; safe
+# performance-wise since jobs already run one at a time on a single thread.
+RUN sed -i 's/num_workers=2/num_workers=0/' \
+    /usr/local/lib/python3.11/site-packages/df/enhance.py
+
 COPY app/ ./app/
 
 ENV DATA_DIR=/data/jobs
