@@ -76,10 +76,12 @@ def _process_job(job_id: str) -> None:
             str(normalized),
         ])
 
-        # DeepFilterNet noise suppression - the `deepFilter` CLI writes its
-        # output into --output-dir using the same base filename as the input.
+        # DeepFilterNet noise suppression - by default the `deepFilter` CLI
+        # appends the model name as a filename suffix (e.g. "..._DeepFilterNet3.wav")
+        # rather than reusing the input's exact basename; --no-suffix disables
+        # that so the output lands at the predictable path we expect below.
         denoised_dir.mkdir(parents=True, exist_ok=True)
-        _run(["deepFilter", str(normalized), "--output-dir", str(denoised_dir)])
+        _run(["deepFilter", str(normalized), "--output-dir", str(denoised_dir), "--no-suffix"])
         denoised_file = denoised_dir / normalized.name
         if not denoised_file.exists():
             raise RuntimeError("DeepFilterNet did not produce an output file")
