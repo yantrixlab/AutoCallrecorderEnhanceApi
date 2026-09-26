@@ -7,8 +7,9 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
-from app import job_store, processing
+from app import billing, job_store, processing
 from app.auth import require_api_key
 
 logging.basicConfig(level=logging.INFO)
@@ -98,6 +99,37 @@ async def download(job_id: str):
         media_type=media_types.get(extension, "application/octet-stream"),
         filename=download_name,
     )
+
+
+class VerifyPurchaseRequest(BaseModel):
+    product_id: str
+    purchase_token: str
+    product_type: str  # "subs" or "inapp"
+
+
+@app.post("/v1/billing/verify", dependencies=[Depends(require_api_key)])
+async def verify_purchase(body: VerifyPurchaseRequest):
+    """Checks a Play Billing purchase token against Google's own records -
+    the app's local purchase state can't be trusted on its own, since a
+    tampered APK could fake it. Reuses the same bearer-token auth as
+    everything else; this endpoint doesn't need a separate secret."""
+    if body.product_type not in ("subs", "inapp"):
+        raise HTTPException(status_code=400, detail="product_type must be 'subs' or 'inapp'")
+
+    try:
+        if body.product_type == "subs":
+            result = billing.verify_subscription(body.product_id, body.purchase_token)
+        else:
+            result = billing.verify_one_time_product(body.product_id, body.purchase_token)
+    except RuntimeError as e:
+        # Service account not configured - a server misconfiguration, not the caller's fault.
+        logger.exception("Billing verification misconfigured")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception("Billing verification failed for product %s", body.product_id)
+        raise HTTPException(status_code=502, detail=f"Could not verify purchase: {e}")
+
+    return result
 
 
 def _human_size(num_bytes: float) -> str:
