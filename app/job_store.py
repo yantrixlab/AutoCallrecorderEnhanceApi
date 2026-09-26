@@ -33,15 +33,22 @@ def init_db() -> None:
             )
             """
         )
+        # Additive migration for deployments created before original_filename
+        # existed - jobs are short-lived (swept after 48h) so there's no real
+        # data to migrate, just the column shape.
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN original_filename TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
-def create_job(extension: str) -> str:
+def create_job(extension: str, original_filename: str) -> str:
     job_id = uuid.uuid4().hex
     with _lock, _connect() as conn:
         conn.execute(
-            "INSERT INTO jobs (job_id, status, extension, created_at) VALUES (?, 'queued', ?, ?)",
-            (job_id, extension, time.time()),
+            "INSERT INTO jobs (job_id, status, extension, created_at, original_filename) VALUES (?, 'queued', ?, ?, ?)",
+            (job_id, extension, time.time(), original_filename),
         )
         conn.commit()
     return job_id

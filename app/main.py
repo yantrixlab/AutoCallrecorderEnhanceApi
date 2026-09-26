@@ -48,7 +48,7 @@ async def start_enhance(file: UploadFile):
     if extension not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: .{extension}")
 
-    job_id = job_store.create_job(extension)
+    job_id = job_store.create_job(extension, file.filename or f"enhanced.{extension}")
     directory = processing.job_dir(job_id)
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -91,10 +91,11 @@ async def download(job_id: str):
         raise HTTPException(status_code=410, detail="Result file no longer available")
 
     media_types = {"m4a": "audio/mp4", "mp3": "audio/mpeg", "wav": "audio/wav"}
+    download_name = row["original_filename"] or f"enhanced.{extension}"
     return FileResponse(
         path=file_path,
         media_type=media_types.get(extension, "application/octet-stream"),
-        filename=f"enhanced.{extension}",
+        filename=download_name,
     )
 
 
