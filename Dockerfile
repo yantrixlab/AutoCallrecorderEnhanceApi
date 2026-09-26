@@ -39,5 +39,12 @@ ENV DATA_DIR=/data/jobs
 ENV DB_PATH=/data/jobs.db
 RUN mkdir -p /data/jobs
 
+# PyTorch defaults to one CPU thread per core for its internal math kernels,
+# each with its own working buffers - on a memory-constrained VPS that adds up
+# fast for no real benefit here (jobs already run one at a time, single audio
+# file, not a batch). Capping this reduces PyTorch's own memory footprint.
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
