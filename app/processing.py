@@ -4,9 +4,12 @@ classical spectral mop-up pass, and only then loudness work on the now-clean
 signal (boosting before denoising just amplifies the noise floor along with the
 speech):
 
-  ffmpeg (highpass rumble removal + notch for any fixed-frequency whine) ->
-  DeepFilterNet (ML denoising, the main noise-removal stage) ->
-  ffmpeg (afftdn spectral mop-up + loudness boost/normalize + re-encode)
+  ffmpeg (highpass rumble removal + notch for any fixed-frequency whine,
+          split into 30s chunks) ->
+  DeepFilterNet (ML denoising per chunk, bounded memory regardless of the
+                 recording's total length) ->
+  ffmpeg (stitch chunks back together, afftdn spectral mop-up, loudness
+          boost/normalize, re-encode)
 
 Jobs run one at a time on a single background thread, to avoid CPU/memory
 contention on a modest VPS."""
@@ -84,8 +87,10 @@ def _process_job(job_id: str) -> None:
     extension = row["extension"]
     directory = job_dir(job_id)
     src = input_path(job_id, extension)
-    resampled = directory / "resampled.wav"
+    chunks_dir = directory / "chunks"
     denoised_dir = directory / "denoised"
+    concat_list = directory / "concat_list.txt"
+    denoised_full = directory / "denoised_full.wav"
     dest = output_path(job_id, extension)
 
     if not src.exists():
@@ -111,18 +116,35 @@ def _process_job(job_id: str) -> None:
         # was the actual cause of soft speech getting chopped out as if it
         # were noise. Loudness work happens after denoising instead, on the
         # already-clean signal.
+        #
+        # Also splits into 30-second chunks (-f segment) instead of one whole
+        # file: DeepFilterNet loads and processes an entire file in memory in
+        # a single pass, with no streaming. A ~15 minute real call recording
+        # got SIGKILLed (exit code -9) by the Linux OOM killer on this VPS
+        # after the model loaded successfully - confirmed via server logs,
+        # not a guess - while an 11-second test clip worked fine. Since this
+        # app records real phone calls that can easily run this long, memory
+        # has to stay bounded regardless of recording length, not just work
+        # for short test clips.
+        chunks_dir.mkdir(parents=True, exist_ok=True)
         _run([
             "ffmpeg", "-y", "-i", str(src),
             "-af", "highpass=f=80,bandreject=f=6890:w=15:t=q",
             "-ar", "48000", "-ac", "1",
-            str(resampled),
+            "-f", "segment", "-segment_time", "30",
+            str(chunks_dir / "chunk%04d.wav"),
         ])
 
-        # DeepFilterNet noise suppression.
+        # DeepFilterNet noise suppression, run once over the whole chunks
+        # directory (--noisy-dir) rather than per-chunk subprocess calls -
+        # it loads and processes one file at a time internally either way
+        # (confirmed from its own source: a DataLoader iterating file paths
+        # one at a time), so batching them into a single invocation keeps
+        # memory bounded per-chunk while only paying model-load overhead once.
         # --no-suffix: by default the `deepFilter` CLI appends the model name as
         # a filename suffix (e.g. "..._DeepFilterNet3.wav") rather than reusing
-        # the input's exact basename; this makes the output land at the
-        # predictable path we expect below.
+        # each input's exact basename; this makes the outputs land at the
+        # predictable paths we expect below.
         # --atten-lim 20: caps how much the model is allowed to attenuate a
         # frame by mixing some of the original signal back in. Without this,
         # DeepFilterNet can fully zero out quiet speech on low-SNR call audio
@@ -139,16 +161,33 @@ def _process_job(job_id: str) -> None:
         # under how much speech it can remove in the process.
         denoised_dir.mkdir(parents=True, exist_ok=True)
         _run([
-            "deepFilter", str(resampled),
+            "deepFilter",
+            "--noisy-dir", str(chunks_dir),
             "--model-base-dir", "DeepFilterNet3",
             "--output-dir", str(denoised_dir),
             "--no-suffix",
             "--atten-lim", "20",
             "--pf",
         ])
-        denoised_file = denoised_dir / resampled.name
-        if not denoised_file.exists():
-            raise RuntimeError("DeepFilterNet did not produce an output file")
+        denoised_chunks = sorted(denoised_dir.glob("chunk*.wav"))
+        if not denoised_chunks:
+            raise RuntimeError("DeepFilterNet did not produce any output chunks")
+
+        # Stitch the denoised chunks back into one file before continuing.
+        # ffmpeg's concat demuxer just needs an ordered list of paths - chunk
+        # filenames are zero-padded (chunk0000.wav, chunk0001.wav, ...) so a
+        # plain sort already puts them back in chronological order.
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for chunk in denoised_chunks:
+                f.write(f"file '{chunk.resolve().as_posix()}'\n")
+        _run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(denoised_full),
+        ])
+        denoised_file = denoised_full
 
         # Now that the signal is clean, mop up any residual noise DeepFilterNet
         # left behind and do the actual loudness work, then re-encode back to
@@ -212,7 +251,7 @@ def _process_job(job_id: str) -> None:
     finally:
         # Only the final output needs to survive for download - intermediate
         # files are pure clutter once we're done (or failed) with them.
-        for temp in (resampled, denoised_dir):
+        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():
