@@ -1,7 +1,15 @@
-"""The actual enhancement pipeline: ffmpeg resample -> DeepFilterNet denoising ->
-ffmpeg loudness boost/normalize + re-encode back to the original format. Jobs run
-one at a time on a single background thread, to avoid CPU/memory contention on a
-modest VPS."""
+"""The actual enhancement pipeline, following the standard professional order for
+cleaning up noisy speech - static cleanup, then the adaptive/ML denoiser, then a
+classical spectral mop-up pass, and only then loudness work on the now-clean
+signal (boosting before denoising just amplifies the noise floor along with the
+speech):
+
+  ffmpeg (highpass rumble removal + notch for any fixed-frequency whine) ->
+  DeepFilterNet (ML denoising, the main noise-removal stage) ->
+  ffmpeg (afftdn spectral mop-up + loudness boost/normalize + re-encode)
+
+Jobs run one at a time on a single background thread, to avoid CPU/memory
+contention on a modest VPS."""
 
 import logging
 import queue
@@ -77,14 +85,25 @@ def _process_job(job_id: str) -> None:
     try:
         job_store.set_status(job_id, "processing")
 
-        # Resample to 48kHz mono only - no loudness boost here. Boosting a quiet,
-        # noisy call recording BEFORE DeepFilterNet sees it raises the noise floor
-        # right along with the speech, which confuses the model's speech/noise
-        # separation and was the actual cause of soft speech getting chopped out
-        # as if it were noise. Loudness work happens after denoising instead, on
-        # the already-clean signal.
+        # Static cleanup pass, before any denoising and with no loudness boost:
+        #   - highpass=80: standard first step of any noise-reduction chain -
+        #     removes sub-80Hz rumble/handling noise that sits below the voice
+        #     fundamental and just adds to the noise floor.
+        #   - bandreject centered on 6890Hz: a real test recording showed a
+        #     constant single-frequency whine at ~6890Hz present even during
+        #     total silence - a classic electrical/hardware tone, not the kind
+        #     of noise an ML model or spectral denoiser targets. A narrow notch
+        #     removes it directly; on recordings that don't have a tone there
+        #     it's a no-op (nothing to cut).
+        # No loudness boost here - boosting a quiet, noisy call recording
+        # BEFORE DeepFilterNet sees it raises the noise floor right along with
+        # the speech, which confuses the model's speech/noise separation and
+        # was the actual cause of soft speech getting chopped out as if it
+        # were noise. Loudness work happens after denoising instead, on the
+        # already-clean signal.
         _run([
             "ffmpeg", "-y", "-i", str(src),
+            "-af", "highpass=f=80,bandreject=f=6890:w=15:t=q",
             "-ar", "48000", "-ac", "1",
             str(resampled),
         ])
@@ -115,8 +134,15 @@ def _process_job(job_id: str) -> None:
         if not denoised_file.exists():
             raise RuntimeError("DeepFilterNet did not produce an output file")
 
-        # Now that the signal is clean, do the actual loudness work and
-        # re-encode back to the original format:
+        # Now that the signal is clean, mop up any residual noise DeepFilterNet
+        # left behind and do the actual loudness work, then re-encode back to
+        # the original format:
+        #   - afftdn: classical FFT spectral-subtraction denoiser, adaptively
+        #     tracking the noise floor (tn=1). This is a second, different
+        #     noise-reduction technique layered on top of the ML model - it
+        #     cleans up steady residual hiss the neural model didn't fully
+        #     remove, the standard "polish pass" in professional noise-reduction
+        #     workflows (never rely on a single denoising technique alone).
         #   - acompressor: gently boosts quiet passages relative to loud ones
         #     (mild 3:1 downward compression) so speech is more consistently
         #     audible, not just louder on average.
@@ -133,7 +159,8 @@ def _process_job(job_id: str) -> None:
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(denoised_file),
-            "-af", "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+            "-af", "afftdn=nr=15:nf=-40:tn=1,"
+                   "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
                    "loudnorm=I=-14:LRA=9:TP=-1.5,"
                    "alimiter=limit=0.85",
             "-ar", "48000",
