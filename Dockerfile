@@ -7,10 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # CPU-only PyTorch wheels - much smaller than the default CUDA build, and this
-# service only ever runs on plain VPS CPU (no GPU available). torchaudio is
-# required by DeepFilterNet's own audio load/save code (df.io) - installing
-# only torch leaves that import failing at runtime with no build-time warning.
-RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# service only ever runs on plain VPS CPU (no GPU available). Pinned to 2.0.x:
+# DeepFilterNet's df.io still imports the old torchaudio.backend.common module,
+# which torchaudio 2.2+ removed entirely (unfixed as of DeepFilterNet 5.0.6 -
+# see https://github.com/Rikorose/DeepFilterNet/issues/662) - confirmed via a
+# live ModuleNotFoundError against the deployed API on "latest".
+RUN pip install --no-cache-dir torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
