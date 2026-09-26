@@ -14,8 +14,10 @@ speech):
 Jobs run one at a time on a single background thread, to avoid CPU/memory
 contention on a modest VPS."""
 
+import json
 import logging
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -61,7 +63,7 @@ def enqueue(job_id: str) -> None:
     _job_queue.put(job_id)
 
 
-def _run(cmd: list) -> None:
+def _run(cmd: list) -> subprocess.CompletedProcess:
     logger.info("Running: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -76,6 +78,25 @@ def _run(cmd: list) -> None:
             f"stdout: {result.stdout.strip()[-2000:]}\n"
             f"stderr: {result.stderr.strip()[-2000:]}"
         )
+    return result
+
+
+def _measure_loudness(input_file: Path, pre_filters: str) -> dict:
+    """Runs loudnorm in measurement-only mode and returns its JSON stats. Needed
+    for two-pass (linear) normalization, which actually hits the target loudness
+    accurately - unlike single-pass "dynamic" mode, which is only a heuristic and
+    was observed silently undershooting badly on an unusually quiet real call,
+    leaving the output below the downstream noise gate's threshold and getting
+    the entire recording muted."""
+    result = _run([
+        "ffmpeg", "-i", str(input_file),
+        "-af", f"{pre_filters},loudnorm=I=-14:LRA=9:TP=-1.5:print_format=json",
+        "-f", "null", "-",
+    ])
+    match = re.search(r"\{[^{}]*\}", result.stderr, re.DOTALL)
+    if not match:
+        raise RuntimeError("Could not parse loudnorm measurement output")
+    return json.loads(match.group(0))
 
 
 def _process_job(job_id: str) -> None:
@@ -201,33 +222,48 @@ def _process_job(job_id: str) -> None:
         #   - acompressor: gently boosts quiet passages relative to loud ones
         #     (mild 3:1 downward compression) so speech is more consistently
         #     audible, not just louder on average.
-        #   - loudnorm: normalizes to a louder target (-14 LUFS, up from the
-        #     previous -16) now that it's operating on clean audio instead of
-        #     noisy audio. Note: loudnorm internally resamples for true-peak
-        #     detection (observed output at 96kHz from a 48kHz input) - the
-        #     explicit -ar 48000 below forces it back afterward.
+        #   - loudnorm: normalizes to -14 LUFS, two-pass/"linear" (measured
+        #     first via _measure_loudness, applied here with measured_* +
+        #     linear=true) rather than single-pass "dynamic" mode. Dynamic
+        #     mode is only a heuristic - on an unusually quiet real call
+        #     (Flipkart IVR test) it silently undershot the target badly,
+        #     landing the whole output below the noise gate's threshold below
+        #     and getting the ENTIRE recording muted, not just some speech.
+        #     Two-pass measurement makes hitting -14 LUFS reliable regardless
+        #     of how quiet or loud the source material is, which is what
+        #     actually makes a fixed gate threshold downstream valid at all.
+        #     Note: loudnorm internally resamples for true-peak detection
+        #     (observed output at 96kHz from a 48kHz input) - the explicit
+        #     -ar 48000 below forces it back afterward.
         #   - agate: noise gate, placed AFTER loudnorm rather than before.
         #     Its threshold was calibrated by measuring real speech (~-18dB)
         #     vs noise-only pauses (~-37dB) on an already-normalized -14 LUFS
         #     reference file - a fixed threshold only means anything once the
-        #     signal is at a known, consistent loudness. Placed before
-        #     loudnorm instead, it saw the raw pre-boost signal - wildly
-        #     different levels depending on how quiet the original recording
-        #     was - and gated out actual speech on a quiet call, producing
-        #     near-total silence. After loudnorm, every job hits the gate at
-        #     the same known loudness, so the same threshold is valid for any
-        #     recording regardless of its original volume.
+        #     signal is reliably at that loudness (see the two-pass note above).
         #   - alimiter: brick-wall safety ceiling in case compression,
         #     normalization or the gate's release edge pushes any transient
         #     close to full scale - left a bit more headroom (0.85, ~-1.4dB)
         #     than loudnorm's own TP target since lossy re-encoding below can
         #     overshoot the true peak of the PCM by a fraction of a dB.
+        pre_loudnorm_filters = (
+            "afftdn=nr=15:nf=-40:tn=1,"
+            "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
+        )
+        measured = _measure_loudness(denoised_file, pre_loudnorm_filters)
+        loudnorm_filter = (
+            "loudnorm=I=-14:LRA=9:TP=-1.5:"
+            f"measured_I={measured['input_i']}:"
+            f"measured_TP={measured['input_tp']}:"
+            f"measured_LRA={measured['input_lra']}:"
+            f"measured_thresh={measured['input_thresh']}:"
+            "linear=true"
+        )
+
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(denoised_file),
-            "-af", "afftdn=nr=15:nf=-40:tn=1,"
-                   "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
-                   "loudnorm=I=-14:LRA=9:TP=-1.5,"
+            "-af", f"{pre_loudnorm_filters},"
+                   f"{loudnorm_filter},"
                    "agate=threshold=0.04:ratio=4:attack=5:release=150:range=0.03,"
                    "alimiter=limit=0.85",
             "-ar", "48000",
@@ -241,6 +277,23 @@ def _process_job(job_id: str) -> None:
 
         if not dest.exists() or dest.stat().st_size == 0:
             raise RuntimeError("Final re-encode produced an empty file")
+
+        # Safety net: if something (the gate or otherwise) still ends up
+        # muting the whole recording, that's a much worse outcome than
+        # simply failing the job - the user would get back a file that looks
+        # successful but is silent. -50dB mean is comfortably below any real
+        # speech but well above true digital silence (which measured -91dB
+        # on the file that triggered this fix), so this only catches genuine
+        # whole-file wipeouts, not just quiet content.
+        volume_check = _run([
+            "ffmpeg", "-i", str(dest), "-af", "volumedetect", "-f", "null", "-",
+        ])
+        mean_volume_match = re.search(r"mean_volume:\s*(-?[\d.]+)\s*dB", volume_check.stderr)
+        if mean_volume_match and float(mean_volume_match.group(1)) < -50:
+            raise RuntimeError(
+                f"Final output is unexpectedly silent (mean volume {mean_volume_match.group(1)}dB) - "
+                "aborting rather than returning a broken result"
+            )
 
         job_store.set_status(job_id, "done")
         logger.info("Job %s done", job_id)
