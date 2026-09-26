@@ -22,6 +22,15 @@ _CODEC_FOR_EXTENSION = {
     "wav": "pcm_s16le",
 }
 
+# Lossy codecs only - ffmpeg's default bitrate for mono AAC/MP3 is far too low
+# (~69kbps) and its own quantization noise becomes clearly audible once the
+# signal is normalized louder, which is exactly the "huge noise" that was
+# actually a low-bitrate re-encode, not leftover background noise.
+_BITRATE_FOR_CODEC = {
+    "aac": "128k",
+    "libmp3lame": "128k",
+}
+
 _job_queue: "queue.Queue[str]" = queue.Queue()
 
 
@@ -113,17 +122,28 @@ def _process_job(job_id: str) -> None:
         #     audible, not just louder on average.
         #   - loudnorm: normalizes to a louder target (-14 LUFS, up from the
         #     previous -16) now that it's operating on clean audio instead of
-        #     noisy audio.
-        #   - alimiter: brick-wall safety ceiling just under 0 dBFS in case
-        #     compression + normalization pushes any transient over the top.
+        #     noisy audio. Note: loudnorm internally resamples for true-peak
+        #     detection (observed output at 96kHz from a 48kHz input) - the
+        #     explicit -ar 48000 below forces it back afterward.
+        #   - alimiter: brick-wall safety ceiling in case compression +
+        #     normalization pushes any transient close to full scale - left
+        #     a bit more headroom (0.85, ~-1.4dB) than loudnorm's own TP
+        #     target since lossy re-encoding below can overshoot the true
+        #     peak of the PCM by a fraction of a dB.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
-        _run([
+        cmd = [
             "ffmpeg", "-y", "-i", str(denoised_file),
             "-af", "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
-                   "loudnorm=I=-14:LRA=9:TP=-1.0,"
-                   "alimiter=limit=0.9",
-            "-c:a", codec, str(dest),
-        ])
+                   "loudnorm=I=-14:LRA=9:TP=-1.5,"
+                   "alimiter=limit=0.85",
+            "-ar", "48000",
+            "-c:a", codec,
+        ]
+        bitrate = _BITRATE_FOR_CODEC.get(codec)
+        if bitrate:
+            cmd += ["-b:a", bitrate]
+        cmd.append(str(dest))
+        _run(cmd)
 
         if not dest.exists() or dest.stat().st_size == 0:
             raise RuntimeError("Final re-encode produced an empty file")
