@@ -1,7 +1,12 @@
 FROM python:3.11-slim
 
+# git: DeepFilterNet's logger shells out to `git rev-parse` for a diagnostic
+# commit-hash log line - its own code already handles "not a git repo"
+# (catches CalledProcessError) but not "git binary missing" (FileNotFoundError),
+# which is what a git-less base image hits every time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
