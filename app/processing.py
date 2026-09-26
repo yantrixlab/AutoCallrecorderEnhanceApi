@@ -1,6 +1,7 @@
-"""The actual enhancement pipeline: ffmpeg loudness normalization -> DeepFilterNet
-denoising -> ffmpeg re-encode back to the original format. Jobs run one at a time
-on a single background thread, to avoid CPU/memory contention on a modest VPS."""
+"""The actual enhancement pipeline: ffmpeg resample -> DeepFilterNet denoising ->
+ffmpeg loudness boost/normalize + re-encode back to the original format. Jobs run
+one at a time on a single background thread, to avoid CPU/memory contention on a
+modest VPS."""
 
 import logging
 import queue
@@ -56,7 +57,7 @@ def _process_job(job_id: str) -> None:
     extension = row["extension"]
     directory = job_dir(job_id)
     src = input_path(job_id, extension)
-    normalized = directory / "normalized.wav"
+    resampled = directory / "resampled.wav"
     denoised_dir = directory / "denoised"
     dest = output_path(job_id, extension)
 
@@ -67,29 +68,57 @@ def _process_job(job_id: str) -> None:
     try:
         job_store.set_status(job_id, "processing")
 
-        # Loudness normalization (EBU R128) + resample to 48kHz mono, which is
-        # what DeepFilterNet expects/works best with.
+        # Resample to 48kHz mono only - no loudness boost here. Boosting a quiet,
+        # noisy call recording BEFORE DeepFilterNet sees it raises the noise floor
+        # right along with the speech, which confuses the model's speech/noise
+        # separation and was the actual cause of soft speech getting chopped out
+        # as if it were noise. Loudness work happens after denoising instead, on
+        # the already-clean signal.
         _run([
             "ffmpeg", "-y", "-i", str(src),
-            "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
             "-ar", "48000", "-ac", "1",
-            str(normalized),
+            str(resampled),
         ])
 
-        # DeepFilterNet noise suppression - by default the `deepFilter` CLI
-        # appends the model name as a filename suffix (e.g. "..._DeepFilterNet3.wav")
-        # rather than reusing the input's exact basename; --no-suffix disables
-        # that so the output lands at the predictable path we expect below.
+        # DeepFilterNet noise suppression.
+        # --no-suffix: by default the `deepFilter` CLI appends the model name as
+        # a filename suffix (e.g. "..._DeepFilterNet3.wav") rather than reusing
+        # the input's exact basename; this makes the output land at the
+        # predictable path we expect below.
+        # --atten-lim 20: caps how much the model is allowed to attenuate a
+        # frame by mixing some of the original signal back in. Without this,
+        # DeepFilterNet can fully zero out quiet speech on low-SNR call audio
+        # because it looks similar to noise - capping the attenuation keeps
+        # that speech audible while still cutting the noise floor substantially.
         denoised_dir.mkdir(parents=True, exist_ok=True)
-        _run(["deepFilter", str(normalized), "--output-dir", str(denoised_dir), "--no-suffix"])
-        denoised_file = denoised_dir / normalized.name
+        _run([
+            "deepFilter", str(resampled),
+            "--output-dir", str(denoised_dir),
+            "--no-suffix",
+            "--atten-lim", "20",
+        ])
+        denoised_file = denoised_dir / resampled.name
         if not denoised_file.exists():
             raise RuntimeError("DeepFilterNet did not produce an output file")
 
-        # Re-encode back to the original format so the app can drop this
-        # straight in to replace the original recording, extension unchanged.
+        # Now that the signal is clean, do the actual loudness work and
+        # re-encode back to the original format:
+        #   - acompressor: gently boosts quiet passages relative to loud ones
+        #     (mild 3:1 downward compression) so speech is more consistently
+        #     audible, not just louder on average.
+        #   - loudnorm: normalizes to a louder target (-14 LUFS, up from the
+        #     previous -16) now that it's operating on clean audio instead of
+        #     noisy audio.
+        #   - alimiter: brick-wall safety ceiling just under 0 dBFS in case
+        #     compression + normalization pushes any transient over the top.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
-        _run(["ffmpeg", "-y", "-i", str(denoised_file), "-c:a", codec, str(dest)])
+        _run([
+            "ffmpeg", "-y", "-i", str(denoised_file),
+            "-af", "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+                   "loudnorm=I=-14:LRA=9:TP=-1.0,"
+                   "alimiter=limit=0.9",
+            "-c:a", codec, str(dest),
+        ])
 
         if not dest.exists() or dest.stat().st_size == 0:
             raise RuntimeError("Final re-encode produced an empty file")
@@ -103,7 +132,7 @@ def _process_job(job_id: str) -> None:
     finally:
         # Only the final output needs to survive for download - intermediate
         # files are pure clutter once we're done (or failed) with them.
-        for temp in (normalized, denoised_dir):
+        for temp in (resampled, denoised_dir):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():
