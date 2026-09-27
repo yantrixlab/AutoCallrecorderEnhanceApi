@@ -3,21 +3,25 @@ processing.py's enhance pipeline, kept independent so this can be tuned
 aggressively without risking the stable, already-shipped /v1/enhance path the
 Android app relies on.
 
-Adds one new stage versus the enhance pipeline: VAD-gated attenuation (see
-vad_gate.py), run AFTER the full afftdn/EQ/speechnorm/loudnorm chain rather
-than before it. This ordering matters a lot: a first attempt ran VAD-gating
-directly on DeepFilterNet's raw output, before speechnorm had a chance to
-boost the remote caller's voice up to a comparable level with the near side -
-at that stage the remote caller's voice is still quiet/noisy enough that VAD
-badly under-detected it as speech, and a real deployed test suppressed most
-of the remote caller's actual speech, not just the background noise between
-words. Confirmed locally: VAD detects only ~20-25% speech coverage on
-DeepFilterNet's raw output, but 65% (matching the recording's real speech
-activity) once run on the SAME audio after the normal loudness/EQ chain has
-already evened out both voices. So the order here is: normalize levels first
-(both voices comparable), detect speech on that normalized signal, then gate
-out everything else - exactly "quiet noise" and no genuine speech, at either
-frequency/voice.
+Unlike the enhance pipeline (which uses ffmpeg's speechnorm - a continuous
+envelope follower with no actual knowledge of where speech starts/stops),
+this pipeline does genuine per-segment speech leveling keyed on Silero VAD
+boundaries (see vad_gate.py) - the same technique real "speech leveler" tools
+(Adobe Audition's Speech Volume Leveler, iZotope RX's Dialogue Leveler,
+Auphonic's own core algorithm) actually use. Two real-world bugs already
+fixed this pipeline's evolution, both worth remembering if this gets touched
+again:
+
+  1. A fixed-dB-threshold noise gate (tried once in processing.py's history)
+     destroyed real speech - loudness alone can't tell "someone's quiet
+     delivery" from "dead air." VAD classifies by acoustic characteristics
+     instead, so it can correctly tell them apart.
+  2. VAD badly under-detects speech on raw/uneven audio (20-25% coverage on a
+     real test call, missing much of the quieter remote-caller side) - it
+     needs reasonably audible input. That's why speech detection here runs on
+     a cheap, throwaway single-pass loudnorm copy rather than on
+     DeepFilterNet's raw output directly - the timestamps transfer back to
+     the original audio regardless of which copy produced them.
 """
 
 import logging
@@ -25,11 +29,12 @@ import re
 import shutil
 from pathlib import Path
 
+import soundfile as sf
+
 from app import job_store, vad_gate
 from app.processing import (
     _BITRATE_FOR_CODEC,
     _CODEC_FOR_EXTENSION,
-    _measure_loudness,
     _run,
     input_path,
     job_dir,
@@ -48,7 +53,9 @@ def _process_denoise_job(row) -> None:
     denoised_dir = directory / "denoised"
     concat_list = directory / "concat_list.txt"
     denoised_full = directory / "denoised_full.wav"
-    normalized_full = directory / "normalized_full.wav"
+    detection_copy = directory / "detection_copy.wav"
+    cleaned_full = directory / "cleaned_full.wav"
+    leveled_full = directory / "leveled_full.wav"
     gated_full = directory / "gated_full.wav"
     dest = output_path(job_id, extension)
 
@@ -100,51 +107,63 @@ def _process_denoise_job(row) -> None:
             str(denoised_full),
         ])
 
-        # Identical to the enhance pipeline's post-chain - see processing.py's
-        # comments for the full reasoning behind each filter (afftdn spectral
-        # mop-up, bass/treble EQ correction, speechnorm for even loudness
-        # between callers, acompressor, two-pass loudnorm). Kept in sync
-        # manually since this pipeline is intentionally a separate,
-        # independently-tunable clone. Output is an intermediate WAV, not the
-        # final file yet - the VAD gate below still needs to run on it.
-        pre_loudnorm_filters = (
-            "afftdn=nr=15:nf=-40:tn=1,"
-            "bass=g=-3:f=200:width_type=h:width=200,"
-            "treble=g=4:f=3000:width_type=h:width=3000,"
-            "speechnorm=e=15:r=0.0004:l=1,"
-            "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
-        )
-        measured = _measure_loudness(denoised_full, pre_loudnorm_filters)
-        loudnorm_filter = (
-            "loudnorm=I=-14:LRA=7:TP=-1.5:"
-            f"measured_I={measured['input_i']}:"
-            f"measured_TP={measured['input_tp']}:"
-            f"measured_LRA={measured['input_lra']}:"
-            f"measured_thresh={measured['input_thresh']}:"
-            "linear=true"
-        )
+        # Cheap, throwaway single-pass loudnorm purely to make speech
+        # detectable to VAD (dynamic mode - no need for the expensive
+        # two-pass "linear" measurement the enhance pipeline uses, since
+        # this copy is discarded immediately after detection).
         _run([
             "ffmpeg", "-y", "-i", str(denoised_full),
-            "-af", f"{pre_loudnorm_filters},{loudnorm_filter}",
+            "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
             "-ar", "48000",
-            str(normalized_full),
+            str(detection_copy),
+        ])
+        speech_segments = vad_gate.detect_speech_segments(detection_copy)
+
+        # Spectral mop-up + tonal balance - identical to the enhance
+        # pipeline's afftdn/bass/treble stages (see processing.py's comments
+        # for the full reasoning). These stay whole-file passes: they're
+        # about overall noise/tone, not per-caller loudness, so
+        # segment-awareness doesn't apply here. Runs on the ORIGINAL
+        # denoised_full, not the throwaway detection copy.
+        _run([
+            "ffmpeg", "-y", "-i", str(denoised_full),
+            "-af", "afftdn=nr=15:nf=-40:tn=1,"
+                   "bass=g=-3:f=200:width_type=h:width=200,"
+                   "treble=g=4:f=3000:width_type=h:width=3000",
+            "-ar", "48000",
+            str(cleaned_full),
         ])
 
-        # THE new stage versus the enhance pipeline, run AFTER normalization -
-        # see this file's module docstring for why the order matters: at this
-        # point both callers' voices sit at a comparable, detectable loudness,
-        # so VAD can tell real (if quiet) speech apart from genuine gaps
-        # between words far more reliably than it could on DeepFilterNet's
-        # raw, still-uneven output.
-        vad_gate.apply_vad_gate(normalized_full, gated_full)
+        # THE core of this pipeline: per-segment RMS leveling instead of a
+        # continuous envelope follower - brings each detected speech segment
+        # toward a common loudness (quiet remote-caller segments come up to
+        # match loud near-caller ones, and vice versa) using the timestamps
+        # detected above. See vad_gate.py's docstring for why this is
+        # "authentic" professional practice, not a novel idea.
+        audio, sr = sf.read(str(cleaned_full), dtype="float32", always_2d=False)
+        leveled = vad_gate.level_speech_segments(audio, sr, speech_segments)
+        sf.write(str(leveled_full), leveled, sr)
 
-        # Final safety ceiling + re-encode to the original format. The
-        # alimiter belongs here, after gating, in case the gate's fade edges
-        # push any transient close to full scale.
+        # Attenuates everything NOT classified as speech, using the same
+        # timestamps as the leveling step above (not re-detected - the
+        # leveled audio isn't necessarily any more VAD-friendly than the
+        # detection copy already was, so there's no reason to re-run
+        # detection and every reason to keep both stages consistent with
+        # exactly the same boundaries).
+        vad_gate.apply_vad_gate(leveled_full, gated_full, speech_segments=speech_segments)
+
+        # Light final touch-up + re-encode: acompressor as a safety net
+        # against any remaining outlier peaks, a single-pass loudnorm for
+        # final overall calibration (a light touch now that segments are
+        # already well-leveled - no need for the expensive two-pass
+        # "linear" measurement the enhance pipeline relies on), and
+        # alimiter as the brick-wall safety ceiling.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(gated_full),
-            "-af", "alimiter=limit=0.85",
+            "-af", "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+                   "loudnorm=I=-14:LRA=7:TP=-1.5,"
+                   "alimiter=limit=0.85",
             "-ar", "48000",
             "-c:a", codec,
         ]
@@ -177,7 +196,8 @@ def _process_denoise_job(row) -> None:
         logger.exception("Denoise job %s failed", job_id)
         job_store.set_status(job_id, "failed", str(e))
     finally:
-        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full, normalized_full, gated_full):
+        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full,
+                     detection_copy, cleaned_full, leveled_full, gated_full):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():

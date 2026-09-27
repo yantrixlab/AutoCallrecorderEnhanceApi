@@ -1,21 +1,30 @@
-"""VAD-gated attenuation for the /v1/remove-background-noise pipeline (see
-processing_denoise.py) - quiets the background between words far more than
-the standard /v1/enhance pipeline does, without repeating the mistake of the
-fixed-dB-threshold noise gate removed from processing.py's history (it
-destroyed real speech: a 3-second window of genuine quiet, -41dB speech came
-back as near-total digital silence). A fixed loudness threshold can't tell
-"someone's quiet delivery" from "dead air," because both can sit at the same
-level - Silero VAD instead classifies audio using learned speech
-characteristics (pitch, formants, spectral shape), so it can correctly keep a
-quiet trailing consonant while still gating genuine silence at the same
-loudness.
+"""VAD-based processing for the /v1/remove-background-noise pipeline (see
+processing_denoise.py) - detects speech regions with Silero VAD (learned
+speech characteristics: pitch, formants, spectral shape) rather than a fixed
+loudness threshold, then uses those regions two ways:
 
-Confirmed locally before writing this: running VAD directly on RAW, noisy
-call audio badly under-detects speech (20.6% of a real test call, missing
-much of the quieter remote-caller side) - running it on the DeepFilterNet
-output instead brought detection up to 58.4%, matching the recording's actual
-visual speech activity. This module is meant to be called AFTER DeepFilterNet
-denoising, never on raw audio.
+  1. level_speech_segments() - per-segment RMS leveling, bringing each
+     detected speech segment toward a common target loudness. This is the
+     same technique real "speech leveler" tools (Adobe Audition's Speech
+     Volume Leveler, iZotope RX's Dialogue Leveler, Auphonic's own core
+     algorithm) use: level per-utterance, not with one continuous whole-file
+     gain curve, because a continuous envelope follower (e.g. ffmpeg's
+     speechnorm, used in the /v1/enhance pipeline) has no actual knowledge of
+     where speech starts/stops.
+  2. apply_vad_gate() - attenuates everything NOT classified as speech.
+
+A fixed-dB-threshold noise gate was tried once in processing.py's history and
+destroyed real speech (a 3-second window of genuine quiet, -41dB speech came
+back as near-total digital silence) - loudness alone can't tell "someone's
+quiet delivery" from "dead air," because both can sit at the same level. VAD
+can, because it classifies by acoustic characteristics instead.
+
+Confirmed locally/in production this session: VAD badly under-detects speech
+on raw or otherwise still-uneven audio (20-25% coverage on a real test call,
+missing much of the quieter remote-caller side) - it needs reasonably
+audible input to work reliably. detect_speech_segments() is meant to be
+called on audio that's already had at least a quick loudness pass, never on
+raw DeepFilterNet output directly.
 """
 
 from pathlib import Path
@@ -61,7 +70,65 @@ def _resample_for_vad(audio: np.ndarray, sr: int) -> np.ndarray:
     return np.interp(x_new, x_old, audio).astype(np.float32)
 
 
-def _build_envelope(num_samples: int, sr: int, speech_segments: list) -> np.ndarray:
+def _load_mono(path: Path) -> tuple:
+    audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    return audio, sr
+
+
+def detect_speech_segments(input_wav: Path) -> list:
+    """Returns Silero VAD's speech timestamps (in seconds) for input_wav.
+    Call this on audio that's already reasonably normalized - see this
+    module's docstring for why raw/uneven audio under-detects."""
+    audio, sr = _load_mono(input_wav)
+    vad_audio = _resample_for_vad(audio, sr)
+    model = _get_model()
+    return get_speech_timestamps(
+        vad_audio, model, sampling_rate=VAD_SAMPLE_RATE,
+        speech_pad_ms=SPEECH_PAD_MS, return_seconds=True,
+    )
+
+
+def level_speech_segments(audio: np.ndarray, sr: int, speech_segments: list,
+                           target_rms_db: float = -20.0, max_gain_db: float = 15.0,
+                           fade_ms: float = 60) -> np.ndarray:
+    """Brings each speech segment's own RMS level toward target_rms_db,
+    clamped to +/-max_gain_db so a very quiet, mostly-noise segment doesn't
+    get pushed to an unnatural level. Gain ramps from 1.0 (unchanged) up to
+    the computed gain over fade_ms at each segment's edges and back down to
+    1.0 at the end, so there's no audible "step" where a segment meets the
+    untouched audio around it. Non-speech audio is left untouched here -
+    apply_vad_gate() handles attenuating it separately."""
+    leveled = audio.copy()
+
+    for seg in speech_segments:
+        start = max(0, int(seg["start"] * sr))
+        end = min(int(seg["end"] * sr), len(audio))
+        if end <= start:
+            continue
+
+        segment = audio[start:end]
+        rms = float(np.sqrt(np.mean(np.square(segment))) + 1e-9)
+        rms_db = 20 * np.log10(rms)
+        gain_db = float(np.clip(target_rms_db - rms_db, -max_gain_db, max_gain_db))
+        gain = 10 ** (gain_db / 20)
+
+        seg_len = end - start
+        fade_samples = min(max(2, int(sr * fade_ms / 1000)), seg_len // 2)
+        gain_curve = np.full(seg_len, gain, dtype=np.float32)
+        if fade_samples > 1:
+            ramp_up = 1.0 + (gain - 1.0) * (1 - np.cos(np.linspace(0, np.pi, fade_samples))) / 2
+            ramp_down = 1.0 + (gain - 1.0) * (1 - np.cos(np.linspace(np.pi, 0, fade_samples))) / 2
+            gain_curve[:fade_samples] = ramp_up
+            gain_curve[-fade_samples:] = ramp_down
+
+        leveled[start:end] = segment * gain_curve
+
+    return leveled
+
+
+def _build_silence_envelope(num_samples: int, sr: int, speech_segments: list) -> np.ndarray:
     floor = 10 ** (ATTENUATION_DB / 20)
     envelope = np.full(num_samples, floor, dtype=np.float32)
 
@@ -87,21 +154,16 @@ def _build_envelope(num_samples: int, sr: int, speech_segments: list) -> np.ndar
     return envelope
 
 
-def apply_vad_gate(input_wav: Path, output_wav: Path) -> None:
-    """Reads input_wav (expected: DeepFilterNet's already-denoised output),
-    attenuates everything Silero VAD doesn't classify as speech, and writes
-    the result to output_wav at the same sample rate/format."""
-    audio, sr = sf.read(str(input_wav), dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+def apply_vad_gate(input_wav: Path, output_wav: Path, speech_segments: list = None) -> None:
+    """Attenuates everything not classified as speech and writes the result
+    to output_wav at the same sample rate. If speech_segments isn't given,
+    detects them directly from input_wav (only safe if input_wav is already
+    reasonably normalized - see this module's docstring)."""
+    audio, sr = _load_mono(input_wav)
 
-    vad_audio = _resample_for_vad(audio, sr)
-    model = _get_model()
-    speech_segments = get_speech_timestamps(
-        vad_audio, model, sampling_rate=VAD_SAMPLE_RATE,
-        speech_pad_ms=SPEECH_PAD_MS, return_seconds=True,
-    )
+    if speech_segments is None:
+        speech_segments = detect_speech_segments(input_wav)
 
-    envelope = _build_envelope(len(audio), sr, speech_segments)
+    envelope = _build_silence_envelope(len(audio), sr, speech_segments)
     gated = audio * envelope
     sf.write(str(output_wav), gated, sr)
