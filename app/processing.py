@@ -246,8 +246,18 @@ def _process_job(job_id: str) -> None:
         #     other. speechnorm instead tracks level over time and actively
         #     re-expands quiet passages (and gently compresses loud ones) as
         #     it plays through, closing exactly this kind of per-segment gap
-        #     regardless of what caused it. e/r tuned conservatively (moderate
-        #     expansion, slow raise rate) to avoid audible "pumping".
+        #     regardless of what caused it.
+        #     r (raise rate) was initially set very conservatively (0.00005)
+        #     to avoid audible "pumping", but a real deployed test still came
+        #     back at LRA 19.3 - barely improved over the pre-fix 24.2. Re-ran
+        #     speechnorm at several r values directly on that real (already
+        #     DeepFilterNet-processed) output to isolate the raise rate as the
+        #     variable: 0.00005 was simply too slow to fully expand short
+        #     quiet passages before they end. r=0.0004 lands at LRA 6.6 on
+        #     that same real file - closely matching the competing vendor's
+        #     own measured 7.7 LU - without the pumping risk of faster values
+        #     (0.001 overshot to LRA 4.3, tighter than even the vendor's own
+        #     output).
         #   - acompressor: gently boosts quiet passages relative to loud ones
         #     (mild 3:1 downward compression) so speech is more consistently
         #     audible, not just louder on average.
@@ -287,7 +297,7 @@ def _process_job(job_id: str) -> None:
             "afftdn=nr=15:nf=-40:tn=1,"
             "bass=g=-3:f=200:width_type=h:width=200,"
             "treble=g=4:f=3000:width_type=h:width=3000,"
-            "speechnorm=e=12.5:r=0.00005:l=1,"
+            "speechnorm=e=15:r=0.0004:l=1,"
             "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
         )
         measured = _measure_loudness(denoised_file, pre_loudnorm_filters)
