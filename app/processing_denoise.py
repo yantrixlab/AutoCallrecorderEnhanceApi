@@ -179,24 +179,28 @@ def _process_denoise_job(row) -> None:
         # below - see vad_gate.apply_vad_gate for the gating logic to bring
         # back later.
 
-        # Final touch-up + re-encode. The output was measured (via ebur128,
-        # a pure standards-compliant measurement - not loudnorm's own
-        # heuristic re-check, which turned out to be unreliable here too)
-        # landing at -19.2 LUFS despite targeting -14: loudnorm can't push
-        # the average up further without violating its own TP=-1.5 ceiling
-        # on the loudest moments, when the loudest and quietest content are
-        # still far apart. The acompressor here was too gentle
-        # (threshold=0.1, ratio=3) to create enough headroom - tightened to
-        # threshold=0.05:ratio=6, confirmed via ebur128 to land right on
-        # target (-14.1 LUFS, LRA 7.0) with no clipping (max -0.6dB).
-        # alimiter's ceiling raised slightly (0.85->0.9) since the stronger
-        # compressor now controls headroom more directly.
+        # Final touch-up + re-encode. Real deployed output measured (via
+        # ebur128, a pure standards-compliant measurement - not loudnorm's
+        # own heuristic re-check, which turned out unreliable here too) at
+        # -19.2 LUFS despite targeting -14, then still -17.9 after a first
+        # attempt to fix it (threshold=0.05:ratio=6): loudnorm can't push
+        # the average up without violating its TP ceiling on the loudest
+        # moments while loud and quiet content are still far apart, and that
+        # first attempt's compression still wasn't strong enough to close
+        # the gap on real (not locally-approximated) pipeline output.
+        # Re-validated by exactly reproducing this pipeline's single-pass
+        # behavior locally (not double-applying compression like the first,
+        # invalid local test did) against real DeepFilterNet output:
+        # threshold=0.008:ratio=15 (aggressive - near limiting) + TP raised
+        # slightly to -1.0 lands at -14.4 LUFS, right on target, with safe
+        # headroom (max -0.3dB, no clipping). alimiter's ceiling raised
+        # accordingly (0.85->0.92).
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(leveled_full),
-            "-af", "acompressor=threshold=0.05:ratio=6:attack=5:release=80,"
-                   "loudnorm=I=-14:LRA=7:TP=-1.5,"
-                   "alimiter=limit=0.9",
+            "-af", "acompressor=threshold=0.008:ratio=15:attack=5:release=80,"
+                   "loudnorm=I=-14:LRA=7:TP=-1.0,"
+                   "alimiter=limit=0.92",
             "-ar", "48000",
             "-c:a", codec,
         ]
