@@ -219,6 +219,17 @@ def _process_job(job_id: str) -> None:
         #     cleans up steady residual hiss the neural model didn't fully
         #     remove, the standard "polish pass" in professional noise-reduction
         #     workflows (never rely on a single denoising technique alone).
+        #   - bass/treble (EQ correction): fixes the output sounding muffled/
+        #     bass-heavy next to a competing vendor's enhanced version.
+        #     Measured band-by-band energy on a real test call: the vendor's
+        #     output is close to flat from 80Hz through 3kHz (-24.2 to -25.9dB),
+        #     while ours had the low end (-24.0dB) sitting 2-4dB louder than
+        #     its own 300Hz-3kHz speech core and 6-12kHz "air" band - correct
+        #     relative to raw phone audio, but noticeably duller than the
+        #     target. A mild low shelf cut plus a presence/air high-shelf boost
+        #     rebalances this without needing any bandwidth the source doesn't
+        #     have - confirmed by re-measuring the same bands afterward, now
+        #     within ~1-2dB of each other end to end.
         #   - speechnorm: THE fix for the remote caller sounding quieter than
         #     the local one. Diagnosed by comparing a real enhanced output
         #     (measured -16.9 LUFS but LRA 24.2 LU - way wider than the 9 LU
@@ -274,6 +285,8 @@ def _process_job(job_id: str) -> None:
         #     overshoot the true peak of the PCM by a fraction of a dB.
         pre_loudnorm_filters = (
             "afftdn=nr=15:nf=-40:tn=1,"
+            "bass=g=-3:f=200:width_type=h:width=200,"
+            "treble=g=4:f=3000:width_type=h:width=3000,"
             "speechnorm=e=12.5:r=0.00005:l=1,"
             "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
         )
