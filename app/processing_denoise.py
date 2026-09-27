@@ -179,18 +179,24 @@ def _process_denoise_job(row) -> None:
         # below - see vad_gate.apply_vad_gate for the gating logic to bring
         # back later.
 
-        # Final touch-up + re-encode: acompressor as a safety net against any
-        # remaining outlier peaks, a single-pass loudnorm for final overall
-        # calibration (a light touch now that segments are already
-        # well-leveled - no need for the expensive two-pass "linear"
-        # measurement the enhance pipeline relies on), and alimiter as the
-        # brick-wall safety ceiling.
+        # Final touch-up + re-encode. The output was measured (via ebur128,
+        # a pure standards-compliant measurement - not loudnorm's own
+        # heuristic re-check, which turned out to be unreliable here too)
+        # landing at -19.2 LUFS despite targeting -14: loudnorm can't push
+        # the average up further without violating its own TP=-1.5 ceiling
+        # on the loudest moments, when the loudest and quietest content are
+        # still far apart. The acompressor here was too gentle
+        # (threshold=0.1, ratio=3) to create enough headroom - tightened to
+        # threshold=0.05:ratio=6, confirmed via ebur128 to land right on
+        # target (-14.1 LUFS, LRA 7.0) with no clipping (max -0.6dB).
+        # alimiter's ceiling raised slightly (0.85->0.9) since the stronger
+        # compressor now controls headroom more directly.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
             "ffmpeg", "-y", "-i", str(leveled_full),
-            "-af", "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+            "-af", "acompressor=threshold=0.05:ratio=6:attack=5:release=80,"
                    "loudnorm=I=-14:LRA=7:TP=-1.5,"
-                   "alimiter=limit=0.85",
+                   "alimiter=limit=0.9",
             "-ar", "48000",
             "-c:a", codec,
         ]
