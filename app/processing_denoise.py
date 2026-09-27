@@ -3,15 +3,21 @@ processing.py's enhance pipeline, kept independent so this can be tuned
 aggressively without risking the stable, already-shipped /v1/enhance path the
 Android app relies on.
 
-Adds exactly one new stage versus the enhance pipeline: VAD-gated attenuation
-(see vad_gate.py) between DeepFilterNet and the existing post-chain
-(afftdn/EQ/speechnorm/loudnorm/limiter, unchanged). This targets the
-background "haze" still audible between words on the enhance pipeline's
-output - confirmed to be a DeepFilterNet residual, not something classical
-filters (afftdn) or speechnorm's own threshold parameter could remove without
-trading away the fixes already made to loudness/EQ. See vad_gate.py's
-docstring for why VAD (not a fixed-dB noise gate, which was tried once and
-destroyed real speech) is the right tool here.
+Adds one new stage versus the enhance pipeline: VAD-gated attenuation (see
+vad_gate.py), run AFTER the full afftdn/EQ/speechnorm/loudnorm chain rather
+than before it. This ordering matters a lot: a first attempt ran VAD-gating
+directly on DeepFilterNet's raw output, before speechnorm had a chance to
+boost the remote caller's voice up to a comparable level with the near side -
+at that stage the remote caller's voice is still quiet/noisy enough that VAD
+badly under-detected it as speech, and a real deployed test suppressed most
+of the remote caller's actual speech, not just the background noise between
+words. Confirmed locally: VAD detects only ~20-25% speech coverage on
+DeepFilterNet's raw output, but 65% (matching the recording's real speech
+activity) once run on the SAME audio after the normal loudness/EQ chain has
+already evened out both voices. So the order here is: normalize levels first
+(both voices comparable), detect speech on that normalized signal, then gate
+out everything else - exactly "quiet noise" and no genuine speech, at either
+frequency/voice.
 """
 
 import logging
@@ -42,6 +48,7 @@ def _process_denoise_job(row) -> None:
     denoised_dir = directory / "denoised"
     concat_list = directory / "concat_list.txt"
     denoised_full = directory / "denoised_full.wav"
+    normalized_full = directory / "normalized_full.wav"
     gated_full = directory / "gated_full.wav"
     dest = output_path(job_id, extension)
 
@@ -93,22 +100,13 @@ def _process_denoise_job(row) -> None:
             str(denoised_full),
         ])
 
-        # THE new stage versus the enhance pipeline: attenuate everything
-        # Silero VAD doesn't classify as speech, before the loudness chain
-        # runs - see vad_gate.py's docstring for the full reasoning. Runs on
-        # the DeepFilterNet output specifically (confirmed locally: running
-        # VAD on raw, noisy audio badly under-detects speech - 20.6% on a
-        # real test call vs 58.4% on the same call's DeepFilterNet output,
-        # missing much of the quieter remote-caller side).
-        vad_gate.apply_vad_gate(denoised_full, gated_full)
-        denoised_file = gated_full
-
-        # From here on, identical to the enhance pipeline's post-chain - see
-        # processing.py's comments for the full reasoning behind each filter
-        # (afftdn spectral mop-up, bass/treble EQ correction, speechnorm for
-        # even loudness between callers, acompressor, two-pass loudnorm,
-        # alimiter safety ceiling). Kept in sync manually since this pipeline
-        # is intentionally a separate, independently-tunable clone.
+        # Identical to the enhance pipeline's post-chain - see processing.py's
+        # comments for the full reasoning behind each filter (afftdn spectral
+        # mop-up, bass/treble EQ correction, speechnorm for even loudness
+        # between callers, acompressor, two-pass loudnorm). Kept in sync
+        # manually since this pipeline is intentionally a separate,
+        # independently-tunable clone. Output is an intermediate WAV, not the
+        # final file yet - the VAD gate below still needs to run on it.
         pre_loudnorm_filters = (
             "afftdn=nr=15:nf=-40:tn=1,"
             "bass=g=-3:f=200:width_type=h:width=200,"
@@ -116,7 +114,7 @@ def _process_denoise_job(row) -> None:
             "speechnorm=e=15:r=0.0004:l=1,"
             "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
         )
-        measured = _measure_loudness(denoised_file, pre_loudnorm_filters)
+        measured = _measure_loudness(denoised_full, pre_loudnorm_filters)
         loudnorm_filter = (
             "loudnorm=I=-14:LRA=7:TP=-1.5:"
             f"measured_I={measured['input_i']}:"
@@ -125,13 +123,28 @@ def _process_denoise_job(row) -> None:
             f"measured_thresh={measured['input_thresh']}:"
             "linear=true"
         )
+        _run([
+            "ffmpeg", "-y", "-i", str(denoised_full),
+            "-af", f"{pre_loudnorm_filters},{loudnorm_filter}",
+            "-ar", "48000",
+            str(normalized_full),
+        ])
 
+        # THE new stage versus the enhance pipeline, run AFTER normalization -
+        # see this file's module docstring for why the order matters: at this
+        # point both callers' voices sit at a comparable, detectable loudness,
+        # so VAD can tell real (if quiet) speech apart from genuine gaps
+        # between words far more reliably than it could on DeepFilterNet's
+        # raw, still-uneven output.
+        vad_gate.apply_vad_gate(normalized_full, gated_full)
+
+        # Final safety ceiling + re-encode to the original format. The
+        # alimiter belongs here, after gating, in case the gate's fade edges
+        # push any transient close to full scale.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
-            "ffmpeg", "-y", "-i", str(denoised_file),
-            "-af", f"{pre_loudnorm_filters},"
-                   f"{loudnorm_filter},"
-                   "alimiter=limit=0.85",
+            "ffmpeg", "-y", "-i", str(gated_full),
+            "-af", "alimiter=limit=0.85",
             "-ar", "48000",
             "-c:a", codec,
         ]
@@ -164,7 +177,7 @@ def _process_denoise_job(row) -> None:
         logger.exception("Denoise job %s failed", job_id)
         job_store.set_status(job_id, "failed", str(e))
     finally:
-        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full, gated_full):
+        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full, normalized_full, gated_full):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():
