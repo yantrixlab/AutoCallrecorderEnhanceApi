@@ -90,7 +90,7 @@ def _measure_loudness(input_file: Path, pre_filters: str) -> dict:
     the entire recording muted."""
     result = _run([
         "ffmpeg", "-i", str(input_file),
-        "-af", f"{pre_filters},loudnorm=I=-14:LRA=9:TP=-1.5:print_format=json",
+        "-af", f"{pre_filters},loudnorm=I=-14:LRA=7:TP=-1.5:print_format=json",
         "-f", "null", "-",
     ])
     match = re.search(r"\{[^{}]*\}", result.stderr, re.DOTALL)
@@ -219,6 +219,24 @@ def _process_job(job_id: str) -> None:
         #     cleans up steady residual hiss the neural model didn't fully
         #     remove, the standard "polish pass" in professional noise-reduction
         #     workflows (never rely on a single denoising technique alone).
+        #   - speechnorm: THE fix for the remote caller sounding quieter than
+        #     the local one. Diagnosed by comparing a real enhanced output
+        #     (measured -16.9 LUFS but LRA 24.2 LU - way wider than the 9 LU
+        #     target below) against running this same post-chain directly on
+        #     the raw recording, skipping DeepFilterNet entirely (LRA 6.6 LU,
+        #     right in range). DeepFilterNet's own per-frame attenuation mask
+        #     - even bounded by --atten-lim - suppresses whichever voice looks
+        #     more "noise-like" per frame, which on a real two-party call is
+        #     disproportionately the far/remote side (captured indirectly via
+        #     mic pickup of the earpiece, always fainter and noisier than the
+        #     near side's direct mic capture). loudnorm alone can't undo this
+        #     because it only normalizes overall integrated loudness - it has
+        #     no notion that one specific voice got flattened more than the
+        #     other. speechnorm instead tracks level over time and actively
+        #     re-expands quiet passages (and gently compresses loud ones) as
+        #     it plays through, closing exactly this kind of per-segment gap
+        #     regardless of what caused it. e/r tuned conservatively (moderate
+        #     expansion, slow raise rate) to avoid audible "pumping".
         #   - acompressor: gently boosts quiet passages relative to loud ones
         #     (mild 3:1 downward compression) so speech is more consistently
         #     audible, not just louder on average.
@@ -232,6 +250,9 @@ def _process_job(job_id: str) -> None:
         #     Two-pass measurement makes hitting -14 LUFS reliable regardless
         #     of how quiet or loud the source material is, which is what
         #     actually makes a fixed gate threshold downstream valid at all.
+        #     LRA target tightened from 9 to 7 to match speechnorm's now-
+        #     narrower input range (and closer to what a competing enhancement
+        #     vendor's output measured: 7.7 LU on the same test call).
         #     Note: loudnorm internally resamples for true-peak detection
         #     (observed output at 96kHz from a 48kHz input) - the explicit
         #     -ar 48000 below forces it back afterward.
@@ -253,11 +274,12 @@ def _process_job(job_id: str) -> None:
         #     overshoot the true peak of the PCM by a fraction of a dB.
         pre_loudnorm_filters = (
             "afftdn=nr=15:nf=-40:tn=1,"
+            "speechnorm=e=12.5:r=0.00005:l=1,"
             "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
         )
         measured = _measure_loudness(denoised_file, pre_loudnorm_filters)
         loudnorm_filter = (
-            "loudnorm=I=-14:LRA=9:TP=-1.5:"
+            "loudnorm=I=-14:LRA=7:TP=-1.5:"
             f"measured_I={measured['input_i']}:"
             f"measured_TP={measured['input_tp']}:"
             f"measured_LRA={measured['input_lra']}:"
