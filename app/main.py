@@ -19,8 +19,14 @@ logger = logging.getLogger("enhance_api")
 app = FastAPI(title="Auto Call Recorder Plus - Enhance API")
 
 SUPPORTED_EXTENSIONS = {"m4a", "mp3", "wav"}
-CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60  # sweep every 6h
-JOB_TTL_SECONDS = 48 * 60 * 60  # delete anything older than 48h regardless of status
+CLEANUP_INTERVAL_SECONDS = 15 * 60  # sweep every 15min - frequent enough that the
+# 2h TTL below is actually meaningful (a 6h sweep interval, as this used to be,
+# would let jobs already past their TTL sit around for up to 6h more before the
+# next sweep even looks at them).
+JOB_TTL_SECONDS = 2 * 60 * 60  # delete uploaded/enhanced files and job records
+# older than 2h regardless of status - was 48h; call recordings can contain
+# sensitive audio, so nothing should linger on the server longer than needed
+# for the app to poll status and download the result.
 
 
 @app.on_event("startup")
