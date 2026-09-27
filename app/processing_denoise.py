@@ -107,13 +107,21 @@ def _process_denoise_job(row) -> None:
             str(denoised_full),
         ])
 
-        # Cheap, throwaway single-pass loudnorm purely to make speech
-        # detectable to VAD (dynamic mode - no need for the expensive
-        # two-pass "linear" measurement the enhance pipeline uses, since
-        # this copy is discarded immediately after detection).
+        # Cheap, throwaway copy purely to make speech detectable to VAD -
+        # discarded immediately after detection, never touches the real
+        # output. Originally just a single-pass loudnorm, which turned out
+        # NOT to meaningfully improve detection over raw DeepFilterNet output
+        # (confirmed on a real deployed test: detected segments matched raw
+        # audio's own poor 20.6% coverage almost exactly, missing most real
+        # speech) - loudnorm targets overall integrated loudness, it doesn't
+        # expand each individual quiet passage the way speechnorm's envelope
+        # follower does. Adding speechnorm here (the same expansion settings
+        # already tuned for /v1/enhance) is what actually exposes quiet
+        # speech to the detector - confirmed locally: 51.8% coverage with it
+        # vs ~20-29% without, on the same test call.
         _run([
             "ffmpeg", "-y", "-i", str(denoised_full),
-            "-af", "loudnorm=I=-16:LRA=11:TP=-1.5",
+            "-af", "speechnorm=e=15:r=0.0004:l=1,loudnorm=I=-16:LRA=11:TP=-1.5",
             "-ar", "48000",
             str(detection_copy),
         ])
