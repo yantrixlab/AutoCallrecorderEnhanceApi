@@ -352,6 +352,16 @@ async def admin_delete_job(job_id: str):
     return {"deleted": job_id, "freed_bytes": freed_bytes, "freed_human": _human_size(freed_bytes)}
 
 
+# Bumped manually on every push where deploy timing is being verified -
+# repeated real-world testing found several pushes taking much longer than
+# expected to actually go live (or, in at least one case, not appearing to
+# go live at all despite a long wait), making it unsafe to assume a push has
+# deployed just because enough time has passed. Checking this against the
+# latest commit's marker is an unambiguous yes/no, unlike inferring from
+# processing behavor which can look similar across versions by coincidence.
+DEPLOY_MARKER = "vad-detection-fix-2918d79"
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "deploy_marker": DEPLOY_MARKER}
