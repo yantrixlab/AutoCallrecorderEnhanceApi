@@ -3,15 +3,17 @@ processing.py's enhance pipeline, kept independent so this can be tuned
 aggressively without risking the stable, already-shipped /v1/enhance path the
 Android app relies on.
 
-CURRENT STATE: noise suppression (VAD-gated attenuation) is deliberately
-DISABLED, at the user's explicit request - real-world testing found speech
+CURRENT STATE: noise suppression (VAD-gated attenuation) was fully disabled
+at one point to isolate and validate leveling + EQ + normalize on their own,
+then re-enabled at a deliberately gentle starting point
+(NOISE_ATTENUATION_DB below) rather than jumping back to a deep cut. Speech
 detection coverage on real DeepFilterNet output tops out around ~40-47% even
-with the richest detection filter tried, meaning gating non-speech risked
-wiping out real (undetected) speech too often. Per user's explicit
-direction: hear what leveling + EQ + normalize alone sounds like, with zero
-background suppressed, before deciding whether/how aggressively to layer
-noise removal back on top. The gating logic itself (vad_gate.apply_vad_gate)
-is untouched and ready to re-enable once that decision is made.
+with the richest detection filter tried, meaning there's always some real
+speech VAD doesn't catch - the gentle starting point is meant to be nudged
+up incrementally against real listening feedback (per the user's own
+request: "gradually increase and see where we can get at, and stay at the
+point"), not jumped to a deep value that risks repeating the earlier
+wiped-out-speech failure.
 
 Unlike the enhance pipeline (which uses ffmpeg's speechnorm - a continuous
 envelope follower with no actual knowledge of where speech starts/stops),
@@ -54,6 +56,18 @@ from app.processing import (
 
 logger = logging.getLogger("enhance_api")
 
+# How much non-speech is attenuated - re-enabled after being fully disabled,
+# starting deliberately gentle (a small, barely-noticeable reduction) rather
+# than jumping back to the -18dB tried before disabling it. Nudge this up in
+# small steps (e.g. -6 -> -9 -> -12) against real listening feedback each
+# time, not all at once - detection coverage on real DeepFilterNet output
+# tops out around 40-47% even with the richest filter tried (see the
+# detection-copy filter below), so there's always some real speech VAD
+# doesn't catch, and the whole point of starting gentle is finding how far
+# this can go before that becomes audible as lost words rather than just
+# quieter background.
+NOISE_ATTENUATION_DB = -6.0
+
 
 def _process_denoise_job(row) -> None:
     job_id = row["job_id"]
@@ -67,6 +81,7 @@ def _process_denoise_job(row) -> None:
     detection_copy = directory / "detection_copy.wav"
     cleaned_full = directory / "cleaned_full.wav"
     leveled_full = directory / "leveled_full.wav"
+    gated_full = directory / "gated_full.wav"
     dest = output_path(job_id, extension)
 
     if not src.exists():
@@ -171,13 +186,13 @@ def _process_denoise_job(row) -> None:
         leveled = vad_gate.level_speech_segments(audio, sr, speech_segments)
         sf.write(str(leveled_full), leveled, sr)
 
-        # Noise suppression (VAD-gated attenuation) deliberately skipped for
-        # now, at the user's explicit request: hear what leveling + EQ +
-        # normalize alone sounds like, with zero background suppressed,
-        # before deciding whether/how aggressively to layer noise removal
-        # back on top. leveled_full feeds straight into the final touch-up
-        # below - see vad_gate.apply_vad_gate for the gating logic to bring
-        # back later.
+        # Noise suppression, re-enabled at NOISE_ATTENUATION_DB (module-level
+        # constant above, currently a deliberately gentle starting point) -
+        # attenuates everything not classified as speech, using the same
+        # timestamps as the leveling step above (not re-detected - keeps
+        # both stages consistent with exactly the same boundaries).
+        vad_gate.apply_vad_gate(leveled_full, gated_full, speech_segments=speech_segments,
+                                 attenuation_db=NOISE_ATTENUATION_DB)
 
         # Final touch-up + re-encode. Real deployed output measured (via
         # ebur128, a pure standards-compliant measurement - not loudnorm's
@@ -197,7 +212,7 @@ def _process_denoise_job(row) -> None:
         # accordingly (0.85->0.92).
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
-            "ffmpeg", "-y", "-i", str(leveled_full),
+            "ffmpeg", "-y", "-i", str(gated_full),
             "-af", "acompressor=threshold=0.008:ratio=15:attack=5:release=80,"
                    "loudnorm=I=-14:LRA=7:TP=-1.0,"
                    "alimiter=limit=0.92",
@@ -232,7 +247,7 @@ def _process_denoise_job(row) -> None:
         job_store.set_status(job_id, "failed", str(e))
     finally:
         for temp in (chunks_dir, denoised_dir, concat_list, denoised_full,
-                     detection_copy, cleaned_full, leveled_full):
+                     detection_copy, cleaned_full, leveled_full, gated_full):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():

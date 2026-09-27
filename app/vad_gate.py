@@ -140,8 +140,9 @@ def level_speech_segments(audio: np.ndarray, sr: int, speech_segments: list,
     return leveled
 
 
-def _build_silence_envelope(num_samples: int, sr: int, speech_segments: list) -> np.ndarray:
-    floor = 10 ** (ATTENUATION_DB / 20)
+def _build_silence_envelope(num_samples: int, sr: int, speech_segments: list,
+                             attenuation_db: float = ATTENUATION_DB) -> np.ndarray:
+    floor = 10 ** (attenuation_db / 20)
     envelope = np.full(num_samples, floor, dtype=np.float32)
 
     for seg in speech_segments:
@@ -166,16 +167,23 @@ def _build_silence_envelope(num_samples: int, sr: int, speech_segments: list) ->
     return envelope
 
 
-def apply_vad_gate(input_wav: Path, output_wav: Path, speech_segments: list = None) -> None:
+def apply_vad_gate(input_wav: Path, output_wav: Path, speech_segments: list = None,
+                    attenuation_db: float = ATTENUATION_DB) -> None:
     """Attenuates everything not classified as speech and writes the result
     to output_wav at the same sample rate. If speech_segments isn't given,
     detects them directly from input_wav (only safe if input_wav is already
-    reasonably normalized - see this module's docstring)."""
+    reasonably normalized - see this module's docstring). attenuation_db lets
+    a caller dial this in gradually from a safe, barely-noticeable starting
+    point rather than jumping straight to a deep cut - detection coverage on
+    real DeepFilterNet output tops out around 40-47% even with the richest
+    filter tried (see processing_denoise.py), so a caller should increase
+    this incrementally against real listening feedback, not assume a deep
+    value is safe by default."""
     audio, sr = _load_mono(input_wav)
 
     if speech_segments is None:
         speech_segments = detect_speech_segments(input_wav)
 
-    envelope = _build_silence_envelope(len(audio), sr, speech_segments)
+    envelope = _build_silence_envelope(len(audio), sr, speech_segments, attenuation_db)
     gated = audio * envelope
     sf.write(str(output_wav), gated, sr)
