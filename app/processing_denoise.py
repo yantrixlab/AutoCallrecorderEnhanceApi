@@ -109,19 +109,28 @@ def _process_denoise_job(row) -> None:
 
         # Cheap, throwaway copy purely to make speech detectable to VAD -
         # discarded immediately after detection, never touches the real
-        # output. Originally just a single-pass loudnorm, which turned out
-        # NOT to meaningfully improve detection over raw DeepFilterNet output
-        # (confirmed on a real deployed test: detected segments matched raw
-        # audio's own poor 20.6% coverage almost exactly, missing most real
-        # speech) - loudnorm targets overall integrated loudness, it doesn't
-        # expand each individual quiet passage the way speechnorm's envelope
-        # follower does. Adding speechnorm here (the same expansion settings
-        # already tuned for /v1/enhance) is what actually exposes quiet
-        # speech to the detector - confirmed locally: 51.8% coverage with it
-        # vs ~20-29% without, on the same test call.
+        # output. Two earlier, weaker versions of this step (plain loudnorm,
+        # then loudnorm+speechnorm alone) were validated only against a local
+        # ffmpeg-only approximation of DeepFilterNet's output - no
+        # DeepFilterNet available outside this server - and both turned out
+        # to badly under-detect real speech once tested against the server's
+        # *actual* DeepFilterNet output (confirmed via the temporary
+        # /v1/debug/denoise-only endpoint): loudnorm alone matched raw
+        # audio's poor ~20% coverage, and adding speechnorm only reached
+        # ~23%. The full afftdn/EQ/speechnorm/acompressor/loudnorm chain -
+        # the same one /v1/enhance already uses - measured at ~39% on that
+        # same real DeepFilterNet output, nearly double either lighter
+        # version. Two-pass "linear" loudnorm measurement made no further
+        # difference over the simpler single-pass version, so single-pass is
+        # kept here for less overhead.
         _run([
             "ffmpeg", "-y", "-i", str(denoised_full),
-            "-af", "speechnorm=e=15:r=0.0004:l=1,loudnorm=I=-16:LRA=11:TP=-1.5",
+            "-af", "afftdn=nr=15:nf=-40:tn=1,"
+                   "bass=g=-3:f=200:width_type=h:width=200,"
+                   "treble=g=4:f=3000:width_type=h:width=3000,"
+                   "speechnorm=e=15:r=0.0004:l=1,"
+                   "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+                   "loudnorm=I=-14:LRA=7:TP=-1.5",
             "-ar", "48000",
             str(detection_copy),
         ])

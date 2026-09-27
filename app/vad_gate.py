@@ -36,13 +36,25 @@ from silero_vad import get_speech_timestamps, load_silero_vad
 VAD_SAMPLE_RATE = 16000
 
 # Padding protects word onsets/offsets (and quiet trailing consonants/breaths)
-# from being clipped by an over-tight speech boundary.
-SPEECH_PAD_MS = 180
+# from being clipped by an over-tight speech boundary. Widened from 180ms
+# after real-world testing (via the temporary /v1/debug/denoise-only
+# endpoint) showed detection on actual DeepFilterNet output topping out
+# around ~39% coverage even with the richest detection-copy filter tried -
+# nowhere near full coverage of a real call's actual speech content. Wider
+# padding is a cheap way to recover some of the speech right at each
+# detected segment's edges, which is exactly where under-detection is most
+# likely to clip a word's start/end.
+SPEECH_PAD_MS = 300
 
-# Attenuate non-speech by ~32dB rather than to full digital silence - keeps a
-# small comfort-noise floor (avoids an unnatural "dead air" cutoff) and stays
-# forgiving if VAD ever misses a genuinely quiet real speech moment.
-ATTENUATION_DB = -32.0
+# Attenuate non-speech by ~18dB rather than the ~32dB first tried - real-
+# world testing (see SPEECH_PAD_MS comment) showed detection coverage is
+# nowhere near reliable enough on real DeepFilterNet output to risk a deep
+# cut: any real speech VAD misses would otherwise come out sounding
+# "wiped out" rather than just quieter. 18dB is still a clearly audible
+# reduction for genuine background noise, but forgiving of the detector's
+# real-world miss rate - erring toward "hear everything, quieter background"
+# over "dead silent background, risk losing words," per explicit priority.
+ATTENUATION_DB = -18.0
 
 # Raised-cosine fade at every speech/non-speech transition - a hard step here
 # is what causes audible clicking.
