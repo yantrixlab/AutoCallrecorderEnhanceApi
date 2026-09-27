@@ -1,12 +1,13 @@
 import logging
 import shutil
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from app import billing, job_store, processing
@@ -164,6 +165,69 @@ async def download_denoise(job_id: str):
         media_type=media_types.get(extension, "application/octet-stream"),
         filename=download_name,
     )
+
+
+@app.post("/v1/debug/denoise-only", dependencies=[Depends(require_api_key)])
+async def debug_denoise_only(file: UploadFile):
+    """Diagnostic-only, not part of the real API surface: runs just the
+    static cleanup + DeepFilterNet stage of the remove-background-noise
+    pipeline and returns that raw result directly, synchronously - no
+    detection/leveling/gating/loudnorm on top. Exists to let VAD detection
+    quality be measured against DeepFilterNet's *actual* real output, rather
+    than an ffmpeg-only local approximation (no DeepFilterNet available
+    outside this server) - a real deployed test still showed the
+    remove-background-noise pipeline suppressing genuine speech even after
+    two attempted fixes based on that approximation, so this closes the gap
+    between what was being tested locally and what the server actually
+    produces."""
+    extension = _extension_of(file.filename or "")
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: .{extension}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        src = tmp_path / f"input.{extension}"
+        with open(src, "wb") as out:
+            shutil.copyfileobj(file.file, out)
+
+        chunks_dir = tmp_path / "chunks"
+        denoised_dir = tmp_path / "denoised"
+        concat_list = tmp_path / "concat_list.txt"
+        denoised_full = tmp_path / "denoised_full.wav"
+
+        chunks_dir.mkdir()
+        processing._run([
+            "ffmpeg", "-y", "-i", str(src),
+            "-af", "highpass=f=80,bandreject=f=6890:w=15:t=q",
+            "-ar", "48000", "-ac", "1",
+            "-f", "segment", "-segment_time", "30",
+            str(chunks_dir / "chunk%04d.wav"),
+        ])
+        denoised_dir.mkdir()
+        processing._run([
+            "deepFilter",
+            "--noisy-dir", str(chunks_dir),
+            "--model-base-dir", "DeepFilterNet3",
+            "--output-dir", str(denoised_dir),
+            "--no-suffix",
+            "--atten-lim", "20",
+            "--pf",
+        ])
+        denoised_chunks = sorted(denoised_dir.glob("chunk*.wav"))
+        if not denoised_chunks:
+            raise HTTPException(status_code=500, detail="DeepFilterNet produced no output")
+
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for chunk in denoised_chunks:
+                f.write(f"file '{chunk.resolve().as_posix()}'\n")
+        processing._run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list), "-c", "copy", str(denoised_full),
+        ])
+
+        data = denoised_full.read_bytes()
+
+    return Response(content=data, media_type="audio/wav")
 
 
 class VerifyPurchaseRequest(BaseModel):
