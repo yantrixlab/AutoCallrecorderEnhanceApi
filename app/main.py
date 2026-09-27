@@ -359,7 +359,7 @@ async def admin_delete_job(job_id: str):
 # deployed just because enough time has passed. Checking this against the
 # latest commit's marker is an unambiguous yes/no, unlike inferring from
 # processing behavor which can look similar across versions by coincidence.
-DEPLOY_MARKER = "denoise-gate-reenabled-gentle-6db"
+DEPLOY_MARKER = "enhance-unified-with-denoise-pipeline"
 
 
 @app.get("/health")

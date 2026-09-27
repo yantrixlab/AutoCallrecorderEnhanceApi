@@ -1,20 +1,22 @@
-"""The actual enhancement pipeline, following the standard professional order for
-cleaning up noisy speech - static cleanup, then the adaptive/ML denoiser, then a
-classical spectral mop-up pass, and only then loudness work on the now-clean
-signal (boosting before denoising just amplifies the noise floor along with the
-speech):
+"""The /v1/enhance pipeline - now unified with /v1/remove-background-noise's
+approach (see processing_denoise.py), after that pipeline's per-segment
+leveling, EQ correction, gentle noise gate, and loudness fix were all
+validated against real DeepFilterNet output over several rounds this
+session. The two stay separate functions/files rather than one shared
+implementation, on purpose: this lets /v1/remove-background-noise keep
+being tuned more aggressively (e.g. its noise-gate depth is still being
+dialed up incrementally) without risking this stable, already-shipped path
+the Android app depends on - if the two ever need genuinely different
+settings again, they can diverge again from here.
 
-  ffmpeg (highpass rumble removal + notch for any fixed-frequency whine,
-          split into 30s chunks) ->
-  DeepFilterNet (ML denoising per chunk, bounded memory regardless of the
-                 recording's total length) ->
-  ffmpeg (stitch chunks back together, afftdn spectral mop-up, loudness
-          boost/normalize, re-encode)
+Pipeline: ffmpeg static cleanup (highpass + notch, chunked) -> DeepFilterNet
+-> ffmpeg afftdn/EQ mop-up -> per-segment VAD-based speech leveling -> gentle
+VAD-gated noise attenuation -> ffmpeg final compressor/loudnorm/limiter ->
+re-encode.
 
 Jobs run one at a time on a single background thread, to avoid CPU/memory
 contention on a modest VPS."""
 
-import json
 import logging
 import queue
 import re
@@ -23,7 +25,9 @@ import subprocess
 import threading
 from pathlib import Path
 
-from app import job_store
+import soundfile as sf
+
+from app import job_store, vad_gate
 
 logger = logging.getLogger("enhance_api")
 
@@ -43,6 +47,15 @@ _BITRATE_FOR_CODEC = {
     "aac": "128k",
     "libmp3lame": "128k",
 }
+
+# How much non-speech is attenuated - kept in sync with
+# processing_denoise.py's own starting point (a small, barely-noticeable
+# reduction, meant to be nudged up gradually against real listening
+# feedback) rather than the deeper -18dB tried and reverted earlier in that
+# pipeline's evolution. Speech detection on real DeepFilterNet output tops
+# out around 40-47% even with the richest detection filter tried, so
+# there's always some real speech VAD doesn't catch.
+NOISE_ATTENUATION_DB = -6.0
 
 _job_queue: "queue.Queue[str]" = queue.Queue()
 
@@ -81,24 +94,6 @@ def _run(cmd: list) -> subprocess.CompletedProcess:
     return result
 
 
-def _measure_loudness(input_file: Path, pre_filters: str) -> dict:
-    """Runs loudnorm in measurement-only mode and returns its JSON stats. Needed
-    for two-pass (linear) normalization, which actually hits the target loudness
-    accurately - unlike single-pass "dynamic" mode, which is only a heuristic and
-    was observed silently undershooting badly on an unusually quiet real call,
-    leaving the output below the downstream noise gate's threshold and getting
-    the entire recording muted."""
-    result = _run([
-        "ffmpeg", "-i", str(input_file),
-        "-af", f"{pre_filters},loudnorm=I=-14:LRA=7:TP=-1.5:print_format=json",
-        "-f", "null", "-",
-    ])
-    match = re.search(r"\{[^{}]*\}", result.stderr, re.DOTALL)
-    if not match:
-        raise RuntimeError("Could not parse loudnorm measurement output")
-    return json.loads(match.group(0))
-
-
 def _process_enhance_job(row) -> None:
     job_id = row["job_id"]
     extension = row["extension"]
@@ -108,6 +103,10 @@ def _process_enhance_job(row) -> None:
     denoised_dir = directory / "denoised"
     concat_list = directory / "concat_list.txt"
     denoised_full = directory / "denoised_full.wav"
+    detection_copy = directory / "detection_copy.wav"
+    cleaned_full = directory / "cleaned_full.wav"
+    leveled_full = directory / "leveled_full.wav"
+    gated_full = directory / "gated_full.wav"
     dest = output_path(job_id, extension)
 
     if not src.exists():
@@ -204,13 +203,32 @@ def _process_enhance_job(row) -> None:
             "-c", "copy",
             str(denoised_full),
         ])
-        denoised_file = denoised_full
 
-        # Now that the signal is clean, mop up any residual noise DeepFilterNet
-        # left behind and do the actual loudness work, then re-encode back to
-        # the original format:
+        # Cheap, throwaway copy purely to make speech detectable to VAD -
+        # discarded immediately after detection, never touches the real
+        # output. Needs the full afftdn/EQ/speechnorm/acompressor/loudnorm
+        # chain to reliably expose quiet speech - lighter filters (plain
+        # loudnorm, or loudnorm+speechnorm alone) were tried and validated
+        # against real DeepFilterNet output via a temporary debug endpoint:
+        # they only reached ~20-23% coverage (no better than raw audio),
+        # while this full chain reached ~39-47%.
+        _run([
+            "ffmpeg", "-y", "-i", str(denoised_full),
+            "-af", "afftdn=nr=15:nf=-40:tn=1,"
+                   "bass=g=-3:f=200:width_type=h:width=200,"
+                   "treble=g=4:f=3000:width_type=h:width=3000,"
+                   "speechnorm=e=15:r=0.0004:l=1,"
+                   "acompressor=threshold=0.1:ratio=3:attack=5:release=60,"
+                   "loudnorm=I=-14:LRA=7:TP=-1.5",
+            "-ar", "48000",
+            str(detection_copy),
+        ])
+        speech_segments = vad_gate.detect_speech_segments(detection_copy)
+
+        # Spectral mop-up + tonal balance, run on the ORIGINAL denoised_full,
+        # not the throwaway detection copy:
         #   - afftdn: classical FFT spectral-subtraction denoiser, adaptively
-        #     tracking the noise floor (tn=1). This is a second, different
+        #     tracking the noise floor (tn=1). A second, different
         #     noise-reduction technique layered on top of the ML model - it
         #     cleans up steady residual hiss the neural model didn't fully
         #     remove, the standard "polish pass" in professional noise-reduction
@@ -224,94 +242,56 @@ def _process_enhance_job(row) -> None:
         #     relative to raw phone audio, but noticeably duller than the
         #     target. A mild low shelf cut plus a presence/air high-shelf boost
         #     rebalances this without needing any bandwidth the source doesn't
-        #     have - confirmed by re-measuring the same bands afterward, now
-        #     within ~1-2dB of each other end to end.
-        #   - speechnorm: THE fix for the remote caller sounding quieter than
-        #     the local one. Diagnosed by comparing a real enhanced output
-        #     (measured -16.9 LUFS but LRA 24.2 LU - way wider than the 9 LU
-        #     target below) against running this same post-chain directly on
-        #     the raw recording, skipping DeepFilterNet entirely (LRA 6.6 LU,
-        #     right in range). DeepFilterNet's own per-frame attenuation mask
-        #     - even bounded by --atten-lim - suppresses whichever voice looks
-        #     more "noise-like" per frame, which on a real two-party call is
-        #     disproportionately the far/remote side (captured indirectly via
-        #     mic pickup of the earpiece, always fainter and noisier than the
-        #     near side's direct mic capture). loudnorm alone can't undo this
-        #     because it only normalizes overall integrated loudness - it has
-        #     no notion that one specific voice got flattened more than the
-        #     other. speechnorm instead tracks level over time and actively
-        #     re-expands quiet passages (and gently compresses loud ones) as
-        #     it plays through, closing exactly this kind of per-segment gap
-        #     regardless of what caused it.
-        #     r (raise rate) was initially set very conservatively (0.00005)
-        #     to avoid audible "pumping", but a real deployed test still came
-        #     back at LRA 19.3 - barely improved over the pre-fix 24.2. Re-ran
-        #     speechnorm at several r values directly on that real (already
-        #     DeepFilterNet-processed) output to isolate the raise rate as the
-        #     variable: 0.00005 was simply too slow to fully expand short
-        #     quiet passages before they end. r=0.0004 lands at LRA 6.6 on
-        #     that same real file - closely matching the competing vendor's
-        #     own measured 7.7 LU - without the pumping risk of faster values
-        #     (0.001 overshot to LRA 4.3, tighter than even the vendor's own
-        #     output).
-        #   - acompressor: gently boosts quiet passages relative to loud ones
-        #     (mild 3:1 downward compression) so speech is more consistently
-        #     audible, not just louder on average.
-        #   - loudnorm: normalizes to -14 LUFS, two-pass/"linear" (measured
-        #     first via _measure_loudness, applied here with measured_* +
-        #     linear=true) rather than single-pass "dynamic" mode. Dynamic
-        #     mode is only a heuristic - on an unusually quiet real call
-        #     (Flipkart IVR test) it silently undershot the target badly,
-        #     landing the whole output below the noise gate's threshold below
-        #     and getting the ENTIRE recording muted, not just some speech.
-        #     Two-pass measurement makes hitting -14 LUFS reliable regardless
-        #     of how quiet or loud the source material is, which is what
-        #     actually makes a fixed gate threshold downstream valid at all.
-        #     LRA target tightened from 9 to 7 to match speechnorm's now-
-        #     narrower input range (and closer to what a competing enhancement
-        #     vendor's output measured: 7.7 LU on the same test call).
-        #     Note: loudnorm internally resamples for true-peak detection
-        #     (observed output at 96kHz from a 48kHz input) - the explicit
-        #     -ar 48000 below forces it back afterward.
-        #   (no noise gate here anymore - removed after it was caught destroying
-        #   real speech on an actual conversation: a 3-second window with clear,
-        #   audible speech in the original - measured -41dB mean / -21dB peak,
-        #   quiet but genuine - came back as -80dB mean / -59dB peak, effectively
-        #   digital silence, in the enhanced output. A single fixed threshold
-        #   can't safely separate "noise" from "someone's naturally quieter
-        #   delivery" across every caller's voice - and for a call-recording
-        #   app, losing real spoken content is a far worse failure than leaving
-        #   a bit of residual hiss between words. DeepFilterNet + afftdn above
-        #   already do the real noise-reduction work; a gate on top of that
-        #   was a cosmetic gain not worth this risk.
-        #   - alimiter: brick-wall safety ceiling in case compression,
-        #     normalization or the gate's release edge pushes any transient
-        #     close to full scale - left a bit more headroom (0.85, ~-1.4dB)
-        #     than loudnorm's own TP target since lossy re-encoding below can
-        #     overshoot the true peak of the PCM by a fraction of a dB.
-        pre_loudnorm_filters = (
-            "afftdn=nr=15:nf=-40:tn=1,"
-            "bass=g=-3:f=200:width_type=h:width=200,"
-            "treble=g=4:f=3000:width_type=h:width=3000,"
-            "speechnorm=e=15:r=0.0004:l=1,"
-            "acompressor=threshold=0.1:ratio=3:attack=5:release=60"
-        )
-        measured = _measure_loudness(denoised_file, pre_loudnorm_filters)
-        loudnorm_filter = (
-            "loudnorm=I=-14:LRA=7:TP=-1.5:"
-            f"measured_I={measured['input_i']}:"
-            f"measured_TP={measured['input_tp']}:"
-            f"measured_LRA={measured['input_lra']}:"
-            f"measured_thresh={measured['input_thresh']}:"
-            "linear=true"
-        )
+        #     have.
+        _run([
+            "ffmpeg", "-y", "-i", str(denoised_full),
+            "-af", "afftdn=nr=15:nf=-40:tn=1,"
+                   "bass=g=-3:f=200:width_type=h:width=200,"
+                   "treble=g=4:f=3000:width_type=h:width=3000",
+            "-ar", "48000",
+            str(cleaned_full),
+        ])
 
+        # Per-segment RMS leveling instead of a continuous envelope
+        # follower (the old speechnorm-only approach) - brings each detected
+        # speech segment toward a common loudness (quiet remote-caller
+        # segments come up to match loud near-caller ones, and vice versa)
+        # using the timestamps detected above. The same technique real
+        # "speech leveler" tools (Adobe Audition's Speech Volume Leveler,
+        # iZotope RX's Dialogue Leveler, Auphonic's own core algorithm)
+        # actually use - a continuous envelope follower has no actual
+        # knowledge of where speech starts/stops, which is what made the
+        # old approach's dynamics tuning fragile.
+        audio, sr = sf.read(str(cleaned_full), dtype="float32", always_2d=False)
+        leveled = vad_gate.level_speech_segments(audio, sr, speech_segments)
+        sf.write(str(leveled_full), leveled, sr)
+
+        # Gentle VAD-gated noise attenuation - NOT a fixed-dB-threshold gate
+        # (tried once, destroyed real speech: a 3-second window of genuine
+        # quiet, -41dB speech came back as near-total digital silence, since
+        # loudness alone can't tell "someone's quiet delivery" from "dead
+        # air"). VAD classifies by acoustic characteristics instead, so it
+        # can correctly tell them apart. Kept deliberately gentle
+        # (NOISE_ATTENUATION_DB above) since detection coverage on real
+        # DeepFilterNet output still tops out around 40-47%.
+        vad_gate.apply_vad_gate(leveled_full, gated_full, speech_segments=speech_segments,
+                                 attenuation_db=NOISE_ATTENUATION_DB)
+
+        # Final touch-up + re-encode. threshold=0.008:ratio=15 (aggressive,
+        # near limiting) is what it actually takes to create enough headroom
+        # for loudnorm to hit -14 LUFS without violating its own TP ceiling -
+        # gentler settings (threshold=0.1:ratio=3, then threshold=0.05:
+        # ratio=6) were both confirmed via ebur128 (a pure standards-
+        # compliant measurement, not loudnorm's own heuristic re-check,
+        # which turned out unreliable) to undershoot the target by
+        # 3.5-5dB on real output. TP raised slightly to -1.0 and alimiter's
+        # ceiling to 0.92 accordingly.
         codec = _CODEC_FOR_EXTENSION.get(extension, "aac")
         cmd = [
-            "ffmpeg", "-y", "-i", str(denoised_file),
-            "-af", f"{pre_loudnorm_filters},"
-                   f"{loudnorm_filter},"
-                   "alimiter=limit=0.85",
+            "ffmpeg", "-y", "-i", str(gated_full),
+            "-af", "acompressor=threshold=0.008:ratio=15:attack=5:release=80,"
+                   "loudnorm=I=-14:LRA=7:TP=-1.0,"
+                   "alimiter=limit=0.92",
             "-ar", "48000",
             "-c:a", codec,
         ]
@@ -324,13 +304,13 @@ def _process_enhance_job(row) -> None:
         if not dest.exists() or dest.stat().st_size == 0:
             raise RuntimeError("Final re-encode produced an empty file")
 
-        # Safety net: if something (the gate or otherwise) still ends up
-        # muting the whole recording, that's a much worse outcome than
-        # simply failing the job - the user would get back a file that looks
-        # successful but is silent. -50dB mean is comfortably below any real
-        # speech but well above true digital silence (which measured -91dB
-        # on the file that triggered this fix), so this only catches genuine
-        # whole-file wipeouts, not just quiet content.
+        # Safety net: if something still ends up muting the whole recording,
+        # that's a much worse outcome than simply failing the job - the user
+        # would get back a file that looks successful but is silent. -50dB
+        # mean is comfortably below any real speech but well above true
+        # digital silence (which measured -91dB on the file that triggered
+        # this fix), so this only catches genuine whole-file wipeouts, not
+        # just quiet content.
         volume_check = _run([
             "ffmpeg", "-i", str(dest), "-af", "volumedetect", "-f", "null", "-",
         ])
@@ -350,7 +330,8 @@ def _process_enhance_job(row) -> None:
     finally:
         # Only the final output needs to survive for download - intermediate
         # files are pure clutter once we're done (or failed) with them.
-        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full):
+        for temp in (chunks_dir, denoised_dir, concat_list, denoised_full,
+                     detection_copy, cleaned_full, leveled_full, gated_full):
             if temp.is_dir():
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():
