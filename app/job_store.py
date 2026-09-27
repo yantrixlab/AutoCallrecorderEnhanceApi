@@ -40,15 +40,25 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN original_filename TEXT")
         except sqlite3.OperationalError:
             pass
+        # 'mode' distinguishes which processing pipeline a job runs through -
+        # 'enhance' (default, existing behavior) or 'remove_background_noise'
+        # (the new, separate pipeline in processing_denoise.py). Keeping one
+        # shared job table/worker queue rather than a second one entirely,
+        # since the actual processing logic - the real risk surface - already
+        # lives in its own separate function/file.
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'enhance'")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
-def create_job(extension: str, original_filename: str) -> str:
+def create_job(extension: str, original_filename: str, mode: str = "enhance") -> str:
     job_id = uuid.uuid4().hex
     with _lock, _connect() as conn:
         conn.execute(
-            "INSERT INTO jobs (job_id, status, extension, created_at, original_filename) VALUES (?, 'queued', ?, ?, ?)",
-            (job_id, extension, time.time(), original_filename),
+            "INSERT INTO jobs (job_id, status, extension, created_at, original_filename, mode) VALUES (?, 'queued', ?, ?, ?, ?)",
+            (job_id, extension, time.time(), original_filename, mode),
         )
         conn.commit()
     return job_id

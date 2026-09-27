@@ -101,6 +101,71 @@ async def download(job_id: str):
     )
 
 
+@app.post("/v1/remove-background-noise", status_code=202, dependencies=[Depends(require_api_key)])
+async def start_remove_background_noise(file: UploadFile):
+    """Same upload contract as /v1/enhance - a separate, experimental pipeline
+    (processing_denoise.py) that adds VAD-gated attenuation on top of the same
+    denoise/loudness chain, aiming for genuine silence between words rather
+    than just quieter background noise. Kept as its own endpoint/job mode so
+    it can be iterated on without risking /v1/enhance, which the shipped
+    Android app already depends on."""
+    extension = _extension_of(file.filename or "")
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: .{extension}")
+
+    job_id = job_store.create_job(
+        extension, file.filename or f"denoised.{extension}", mode="remove_background_noise"
+    )
+    directory = processing.job_dir(job_id)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    dest = processing.input_path(job_id, extension)
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+
+    if dest.stat().st_size == 0:
+        job_store.delete_job(job_id)
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    processing.enqueue(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/v1/remove-background-noise/{job_id}", dependencies=[Depends(require_api_key)])
+async def get_denoise_status(job_id: str):
+    row = job_store.get_job(job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    response = {"job_id": job_id, "status": row["status"], "error": row["error"]}
+    if row["status"] == "done":
+        response["download_url"] = f"/v1/remove-background-noise/{job_id}/download"
+    return response
+
+
+@app.get("/v1/remove-background-noise/{job_id}/download", dependencies=[Depends(require_api_key)])
+async def download_denoise(job_id: str):
+    row = job_store.get_job(job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if row["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"Job is not done yet (status: {row['status']})")
+
+    extension = row["extension"]
+    file_path = processing.output_path(job_id, extension)
+    if not file_path.exists():
+        raise HTTPException(status_code=410, detail="Result file no longer available")
+
+    media_types = {"m4a": "audio/mp4", "mp3": "audio/mpeg", "wav": "audio/wav"}
+    download_name = row["original_filename"] or f"denoised.{extension}"
+    return FileResponse(
+        path=file_path,
+        media_type=media_types.get(extension, "application/octet-stream"),
+        filename=download_name,
+    )
+
+
 class VerifyPurchaseRequest(BaseModel):
     product_id: str
     purchase_token: str

@@ -99,12 +99,8 @@ def _measure_loudness(input_file: Path, pre_filters: str) -> dict:
     return json.loads(match.group(0))
 
 
-def _process_job(job_id: str) -> None:
-    row = job_store.get_job(job_id)
-    if row is None:
-        logger.warning("Job %s vanished before processing", job_id)
-        return
-
+def _process_enhance_job(row) -> None:
+    job_id = row["job_id"]
     extension = row["extension"]
     directory = job_dir(job_id)
     src = input_path(job_id, extension)
@@ -359,6 +355,22 @@ def _process_job(job_id: str) -> None:
                 shutil.rmtree(temp, ignore_errors=True)
             elif temp.exists():
                 temp.unlink(missing_ok=True)
+
+
+def _process_job(job_id: str) -> None:
+    row = job_store.get_job(job_id)
+    if row is None:
+        logger.warning("Job %s vanished before processing", job_id)
+        return
+
+    mode = row["mode"] if "mode" in row.keys() else "enhance"
+    if mode == "remove_background_noise":
+        # Imported lazily to avoid a circular import (processing_denoise
+        # imports plumbing helpers back from this module).
+        from app import processing_denoise
+        processing_denoise._process_denoise_job(row)
+    else:
+        _process_enhance_job(row)
 
 
 def _worker_loop() -> None:
